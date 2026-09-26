@@ -54,6 +54,8 @@ struct ServiceSetup {
     details_open: bool,
     show_key: bool,
     models: crate::model_discovery::State,
+    /// 本机 CLI 检测结果（载入草稿 / 切换类型时刷新；渲染只读）
+    local_cli: Option<Result<String, String>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -149,6 +151,7 @@ impl ServiceSetup {
             details_open: false,
             show_key: false,
             models: crate::model_discovery::State::default(),
+            local_cli: None,
             _subscriptions: subscriptions,
         }
     }
@@ -567,6 +570,7 @@ impl Desktop {
         service.cancel();
         service.running = None;
         service.draft = draft.clone();
+        service.local_cli = preferences::detect_local_cli(draft.protocol);
         service.original = original;
         service.pending_version = None;
         service.models.invalidate();
@@ -729,8 +733,8 @@ impl Desktop {
             smol::block_on(async move {
                 let mut results = Vec::new();
                 for kind in required {
-                    // Codex 订阅服务走 CLI 方言（Responses/SSE）检查登录态与模型
-                    let evidence = if config.protocol == preferences::ServiceProtocol::CodexResponses
+                    // 订阅类服务（Codex 登录态、本机 CLI）走核心的检查通道
+                    let evidence = if config.protocol.subscription_test()
                     {
                         service_test::test_codex_blocking(&config, kind, &cancel)
                     } else {
@@ -1528,12 +1532,14 @@ impl Desktop {
             service.errors.clear();
             service.models.invalidate();
             if kind_changed {
-                // 模型 ID 不跨服务类型携带；Codex 连接成功后由账号目录自动填充
-                service.draft.model.clear();
+                // 模型 ID 不跨服务类型携带；Codex 连接成功后由账号目录自动填充，本机 CLI 预填推荐模型
+                let model = protocol.default_model().unwrap_or_default();
+                service.draft.model = model.to_string();
                 service.inputs[&InputField::Model].update(cx, |input, cx| {
-                    input.set_value("", window, cx);
+                    input.set_value(model, window, cx);
                 });
             }
+            service.local_cli = preferences::detect_local_cli(protocol);
             if protocol.keyless() {
                 service.draft.authentication = Authentication::None;
                 service.inputs[&InputField::Key].update(cx, |input, cx| {
@@ -1555,6 +1561,8 @@ impl Desktop {
             }
             // 离开 Codex 时清掉固定地址（非用户数据），其余输入保留
             _ if is_codex_address => Some(""),
+            // 本机 CLI 不用地址：清空，避免保存残留的旧地址
+            _ if protocol.cli_kind().is_some() => Some(""),
             _ => None,
         };
         if let Some(next) = next {
@@ -1629,6 +1637,12 @@ impl Desktop {
             == preferences::ServiceProtocol::CodexResponses
         {
             self.codex_refresh_models(crate::codex_ui::CodexSurface::Onboarding, cx);
+            return;
+        }
+        // 本机 CLI 没有模型目录接口：给出推荐模型，其余模型 ID 由用户直接输入
+        if let Some(model) = self.onboarding.service(purpose).draft.protocol.default_model() {
+            self.onboarding.service_mut(purpose).models.prime(vec![model.to_string()]);
+            cx.notify();
             return;
         }
         let service = self.onboarding.service(purpose);
@@ -1835,23 +1849,16 @@ impl Desktop {
                         SingleChoiceGroup::new("setup-ai-kind", "AI 服务类型")
                             .full_width()
                             .options(
-                                [
-                                    preferences::ServiceProtocol::AiChat,
-                                    preferences::ServiceProtocol::OllamaChat,
-                                    preferences::ServiceProtocol::CodexResponses,
-                                ]
+                                preferences::ServiceProtocol::ALL
                                 .into_iter()
+                                .filter(|candidate| candidate.purpose() == ServicePurpose::Ai)
                                 .map(|candidate| (candidate.label(), candidate.ai_kind_label())),
                             )
                             .selected(service.draft.protocol.label())
                             .disabled(busy)
                             .on_change(cx.listener(
                                 |this, value: &SharedString, window, cx| {
-                                    let Some(protocol) = [
-                                        preferences::ServiceProtocol::AiChat,
-                                        preferences::ServiceProtocol::OllamaChat,
-                                        preferences::ServiceProtocol::CodexResponses,
-                                    ]
+                                    let Some(protocol) = preferences::ServiceProtocol::ALL
                                     .into_iter()
                                     .find(|candidate| candidate.label() == value.as_ref())
                                     else {
@@ -1865,9 +1872,14 @@ impl Desktop {
             );
         }
         let codex = service.draft.protocol == preferences::ServiceProtocol::CodexResponses;
-        if !codex {
+        if service.draft.protocol.has_address() {
             body = body.child(self.setup_input_row(purpose, InputField::Address, "服务地址", cx));
-        } else {
+        } else if let Some(detected) = &service.local_cli {
+            body = body.child(help(
+                "setup-local-cli",
+                preferences::local_cli_note(service.draft.protocol, detected),
+            ));
+        } else if codex {
             body = body.child(help("setup-codex-endpoint", crate::codex_ui::ENDPOINT_NOTE));
         }
         if !service.draft.protocol.keyless() {

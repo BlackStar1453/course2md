@@ -261,13 +261,21 @@ pub enum ServiceProtocol {
     OllamaChat,
     /// OpenAI Codex 订阅登录（ChatGPT 后端 Responses API；凭据由 CLI 令牌文件持有）
     CodexResponses,
+    /// 本机 Claude Code（运行 claude，走 Claude 订阅；无地址、无密钥）
+    ClaudeCodeCli,
+    /// 本机 Codex CLI（运行 codex，走 ChatGPT 订阅；登录由 Codex CLI 自己管理）
+    CodexCli,
 }
 
 impl ServiceProtocol {
     pub fn purpose(self) -> ServicePurpose {
         match self {
             Self::SpeechTranscriptions | Self::SpeechChat => ServicePurpose::Speech,
-            Self::AiChat | Self::OllamaChat | Self::CodexResponses => ServicePurpose::Ai,
+            Self::AiChat
+            | Self::OllamaChat
+            | Self::CodexResponses
+            | Self::ClaudeCodeCli
+            | Self::CodexCli => ServicePurpose::Ai,
         }
     }
 
@@ -278,6 +286,8 @@ impl ServiceProtocol {
             Self::AiChat => "AI 聊天（/chat/completions）",
             Self::OllamaChat => "Ollama 本地服务（/v1/chat/completions）",
             Self::CodexResponses => "OpenAI Codex 订阅（/responses）",
+            Self::ClaudeCodeCli => "Claude Code 订阅（本机 claude）",
+            Self::CodexCli => "Codex CLI 订阅（本机 codex）",
         }
     }
 
@@ -286,12 +296,49 @@ impl ServiceProtocol {
             Self::SpeechTranscriptions => "/audio/transcriptions",
             Self::SpeechChat | Self::AiChat | Self::OllamaChat => "/chat/completions",
             Self::CodexResponses => "/responses",
+            // 本机 CLI 不走网络，没有接口路径
+            Self::ClaudeCodeCli | Self::CodexCli => "",
         }
     }
 
-    /// 无需 API Key 的服务类型：Ollama 本地服务不鉴权，Codex 由 CLI 令牌文件鉴权。
+    /// 无需 API Key 的服务类型：Ollama 本地服务不鉴权，Codex 由 CLI 令牌文件鉴权，
+    /// 本机 CLI 使用各自已登录的订阅。
     pub fn keyless(self) -> bool {
-        matches!(self, Self::OllamaChat | Self::CodexResponses)
+        matches!(
+            self,
+            Self::OllamaChat | Self::CodexResponses | Self::ClaudeCodeCli | Self::CodexCli
+        )
+    }
+
+    /// 全部服务类型（设置编辑器与首次引导按用途过滤后展示为选项）。
+    pub const ALL: [Self; 7] = [
+        Self::SpeechTranscriptions,
+        Self::SpeechChat,
+        Self::AiChat,
+        Self::OllamaChat,
+        Self::CodexResponses,
+        Self::ClaudeCodeCli,
+        Self::CodexCli,
+    ];
+
+    /// 需要用户填写服务地址（Codex 地址固定，本机 CLI 没有地址）。
+    pub fn has_address(self) -> bool {
+        self != Self::CodexResponses && self.cli_kind().is_none()
+    }
+
+    /// 连接检查走核心的订阅通道（Codex 登录态或本机 CLI），而非桌面 HTTP 测试。
+    pub fn subscription_test(self) -> bool {
+        self == Self::CodexResponses || self.cli_kind().is_some()
+    }
+
+    /// 本机 CLI 的推荐模型（切换到该类型时预填）。
+    pub fn default_model(self) -> Option<&'static str> {
+        self.cli_kind().map(course2md::cli_provider::CliKind::default_model)
+    }
+
+    /// 由本机 CLI 承载的服务类型（没有服务地址，改为检测本机程序）。
+    pub fn cli_kind(self) -> Option<course2md::cli_provider::CliKind> {
+        course2md::cli_provider::CliKind::of(self.llm_provider())
     }
 
     /// AI 服务类型的胶囊选项名：设置编辑器与首次引导共用同一来源。
@@ -300,6 +347,8 @@ impl ServiceProtocol {
             Self::AiChat => "OpenAI 兼容服务",
             Self::OllamaChat => "Ollama 本地服务",
             Self::CodexResponses => "OpenAI Codex 订阅",
+            Self::ClaudeCodeCli => "Claude Code",
+            Self::CodexCli => "Codex CLI",
             other => other.label(),
         }
     }
@@ -309,8 +358,33 @@ impl ServiceProtocol {
         match self {
             Self::OllamaChat => course2md::llm::LlmProvider::Ollama,
             Self::CodexResponses => course2md::llm::LlmProvider::Codex,
+            Self::ClaudeCodeCli => course2md::llm::LlmProvider::ClaudeCode,
+            Self::CodexCli => course2md::llm::LlmProvider::CodexCli,
             _ => course2md::llm::LlmProvider::OpenAiCompatible,
         }
+    }
+}
+
+/// 本机 CLI 的检测结果（设置与首次引导展示用）：找到则为程序路径，否则为可操作的说明。
+/// 会访问文件系统，只在打开编辑器或切换服务类型时调用，不在渲染中调用。
+pub fn detect_local_cli(protocol: ServiceProtocol) -> Option<std::result::Result<String, String>> {
+    let kind = protocol.cli_kind()?;
+    Some(match course2md::cli_provider::CliRunner::locate(kind) {
+        Ok(runner) => Ok(runner.binary().display().to_string()),
+        Err(_) => Err(format!(
+            "找不到本机 {program}。请先安装并登录 {program}，或设置环境变量 {var} 指向它。",
+            program = kind.program(),
+            var = kind.env_override(),
+        )),
+    })
+}
+
+/// 本机 CLI 检测结果对应的说明文字。
+pub fn local_cli_note(protocol: ServiceProtocol, detected: &std::result::Result<String, String>) -> String {
+    let program = protocol.cli_kind().map_or("", course2md::cli_provider::CliKind::program);
+    match detected {
+        Ok(path) => format!("将使用本机 {program}（{path}）和你已登录的订阅，无需服务地址与 API Key。"),
+        Err(message) => message.clone(),
     }
 }
 
@@ -1337,8 +1411,9 @@ impl Store {
                 bail!("所选服务不支持 AI 校对或摘要");
             }
             config.llm.provider = version.config.protocol.llm_provider();
-            // Codex 方言端点固定（provider::endpoint 忽略 base_url）；按 CLI 约定留空
-            config.llm.base_url = if version.config.protocol == ServiceProtocol::CodexResponses {
+            // Codex 方言端点固定（provider::endpoint 忽略 base_url），本机 CLI 不走网络；按 CLI 约定留空
+            let protocol = version.config.protocol;
+            config.llm.base_url = if protocol == ServiceProtocol::CodexResponses || protocol.cli_kind().is_some() {
                 String::new()
             } else {
                 version.config.endpoint.clone()
@@ -1709,6 +1784,10 @@ fn clear_service_fields(config: &mut ConfigFile) {
 /// endpoint is an error, never silently changed to another protocol. URL credentials,
 /// query-string tokens and fragments are rejected before they can enter normal files/logs.
 pub fn normalize_endpoint(address: &str, protocol: ServiceProtocol) -> Result<String> {
+    // 本机 CLI 没有网络地址：统一用固定标识（与核心请求记录一致），忽略残留输入
+    if protocol.cli_kind().is_some() {
+        return Ok(format!("cli://{}", protocol.llm_provider().as_str()));
+    }
     let mut url = url::Url::parse(address.trim())
         .map_err(|_| anyhow!("请输入包含 http:// 或 https:// 的服务地址"))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -2136,6 +2215,18 @@ mod tests {
     }
 
     #[test]
+    fn cli_services_use_a_fixed_address_whatever_was_typed() {
+        for protocol in [ServiceProtocol::ClaudeCodeCli, ServiceProtocol::CodexCli] {
+            let fixed = normalize_endpoint("", protocol).unwrap();
+            assert!(fixed.starts_with("cli://"), "{fixed}");
+            assert_eq!(normalize_endpoint("https://leftover.example/v1", protocol).unwrap(), fixed);
+            assert!(protocol.keyless());
+            assert_eq!(protocol.purpose(), ServicePurpose::Ai);
+            assert!(service_host("", protocol).is_some());
+        }
+    }
+
+    #[test]
     fn keyless_services_publish_and_map_to_cli_providers() {
         for (protocol, address, provider) in [
             (
@@ -2147,6 +2238,17 @@ mod tests {
                 ServiceProtocol::CodexResponses,
                 CODEX_ADDRESS,
                 course2md::llm::LlmProvider::Codex,
+            ),
+            // 本机 CLI：没有服务地址可填，留空也能发布
+            (
+                ServiceProtocol::ClaudeCodeCli,
+                "",
+                course2md::llm::LlmProvider::ClaudeCode,
+            ),
+            (
+                ServiceProtocol::CodexCli,
+                "",
+                course2md::llm::LlmProvider::CodexCli,
             ),
         ] {
             let (directory, mut store) = isolated();
@@ -2170,8 +2272,8 @@ mod tests {
             assert_eq!(resolved.llm.provider, provider);
             assert!(resolved.llm.api_key.is_empty());
             assert_eq!(resolved.llm.model, "fixture-model");
-            if protocol == ServiceProtocol::CodexResponses {
-                // CLI 约定：Codex 的 base_url 留空（方言端点固定）
+            if protocol == ServiceProtocol::CodexResponses || protocol.cli_kind().is_some() {
+                // CLI 约定：Codex 与本机 CLI 的 base_url 留空（方言端点固定 / 不走网络）
                 assert!(resolved.llm.base_url.is_empty());
             } else {
                 assert!(resolved.llm.base_url.starts_with("http"));

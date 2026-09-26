@@ -9,7 +9,7 @@ use gpui_component::button::ButtonVariants as _;
 
 /// Codex 固定端点说明：设置编辑器与首次引导共用同一文案。
 pub(crate) const ENDPOINT_NOTE: &str =
-    "请求固定发往 OpenAI Codex 后端；无需服务地址与 API Key。";
+    "请求固定发往 OpenAI Codex 后端；无需服务地址与 API Key。此方式会复制本机 Codex 的登录并自行刷新，可能让本机 Codex CLI 需要重新登录；已安装 Codex CLI 时，建议改选「Codex CLI」。";
 
 /// 识别根 crate 的登录缺失/失效标记，替换为界面内的连接引导。
 fn login_required(error: &anyhow::Error) -> bool {
