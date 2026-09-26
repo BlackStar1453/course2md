@@ -36,6 +36,8 @@ pub enum LlmProvider {
     Ollama,
     /// OpenAI Codex 订阅登录（ChatGPT 后端 Responses API）
     Codex,
+    /// 本机 Claude Code CLI（`claude -p`，走 Claude 订阅）
+    ClaudeCode,
 }
 
 impl LlmProvider {
@@ -44,6 +46,7 @@ impl LlmProvider {
             Self::OpenAiCompatible => "openai-compatible",
             Self::Ollama => "ollama",
             Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
         }
     }
 }
@@ -105,7 +108,8 @@ pub fn endpoint(base_url: &str) -> String {
 
 /// 校验配置可直接使用。
 pub fn validate(s: &LlmSettings) -> Result<()> {
-    if s.provider != LlmProvider::Codex && s.base_url.trim().is_empty() {
+    let keyless = s.provider == LlmProvider::Codex || crate::cli_provider::CliKind::of(s.provider).is_some();
+    if !keyless && s.base_url.trim().is_empty() {
         bail!("未配置 LLM 服务地址。 / LLM base URL is missing. Run: course2md llm setup");
     }
     if s.model.trim().is_empty() {
@@ -121,6 +125,23 @@ pub fn validate(s: &LlmSettings) -> Result<()> {
 const DEFAULT_CONCURRENCY: usize = 8;
 /// 润色并发上限：再高对端点限流没有好处，只放大 429 风险
 const MAX_CONCURRENCY: usize = 16;
+/// CLI Provider 默认并发：每次调用都要启动进程，且共享同一份订阅额度。
+const CLI_DEFAULT_CONCURRENCY: usize = 2;
+/// CLI Provider 并发上限。
+const CLI_MAX_CONCURRENCY: usize = 4;
+
+/// 实际并发数。CLI Provider 未调整过（仍是 HTTP 默认值）时用 2，最多 4。
+pub fn effective_concurrency(s: &LlmSettings) -> usize {
+    if crate::cli_provider::CliKind::of(s.provider).is_some() {
+        if s.concurrency == DEFAULT_CONCURRENCY {
+            CLI_DEFAULT_CONCURRENCY
+        } else {
+            s.concurrency.clamp(1, CLI_MAX_CONCURRENCY)
+        }
+    } else {
+        s.concurrency.clamp(1, MAX_CONCURRENCY)
+    }
+}
 /// LLM 请求最大尝试次数（1 次原始 + 重试）。
 const MAX_ATTEMPTS: usize = 3;
 
@@ -142,7 +163,7 @@ pub(crate) const CHAT_MAX_TOKENS: u32 = 16384;
 /// 构造标准 chat/completions 请求体（temperature=0、json_object 结构化输出）。
 /// 润色与总结共用，避免两处各自拼 body 参数漂移；
 /// `user` 传 &str 为纯文本消息，传 `serde_json::Value::Array` 为多模态内容块。
-pub(crate) fn chat_body(
+pub fn chat_body(
     model: &str,
     system: &str,
     user: impl Into<serde_json::Value>,
@@ -199,7 +220,7 @@ pub fn polish_sections_report(
         return Ok(PolishReport::default());
     }
     let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let workers = s.concurrency.clamp(1, MAX_CONCURRENCY);
+    let workers = effective_concurrency(s);
     // 整个任务共享一个 agent（连接池复用 TCP+TLS），不再每请求新建
     let agent = chat_agent();
     let succeeded = std::sync::atomic::AtomicUsize::new(0);
@@ -800,6 +821,9 @@ fn request_chat_once(
     description: &str,
 ) -> std::result::Result<serde_json::Value, ChatFailure> {
     let url = crate::provider::endpoint(s);
+    if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
+        return request_cli_once(kind, s, body, purpose, description, &url);
+    }
     let headers = crate::provider::auth_headers(s).map_err(|err| ChatFailure {
         retryable: false,
         err,
@@ -826,7 +850,42 @@ fn request_chat_once(
             });
         }
         Ok(response)
-    }, |value| {
+    }, |value| validate_chat_response(value, body, purpose)).map_err(|failure| ChatFailure { retryable: failure.retryable, err: anyhow::Error::new(failure) })
+}
+
+/// CLI Provider 的一次请求：启动 CLI，把最终文本包成 chat/completions 响应，
+/// 走与 HTTP 相同的请求记录与响应校验。进程没起来 = 请求确定未发出。
+fn request_cli_once(
+    kind: crate::cli_provider::CliKind,
+    s: &LlmSettings,
+    body: &serde_json::Value,
+    purpose: &str,
+    description: &str,
+    url: &str,
+) -> std::result::Result<serde_json::Value, ChatFailure> {
+    let runner = crate::cli_provider::CliRunner::locate(kind).map_err(|err| ChatFailure {
+        retryable: false,
+        err: anyhow::Error::new(err),
+    })?;
+    crate::dispatch::json_request_described("llm", purpose, description, url, body, || {
+        let text = runner
+            .complete(&s.model, body, None, &|| crate::dispatch::check_control().is_err())
+            .map_err(|e| crate::dispatch::NetworkFailure {
+                message: e.message,
+                definitely_unsent: e.not_started,
+            })?;
+        let wrapped = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": text}}]});
+        Ok(crate::dispatch::HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&wrapped).unwrap_or_default(),
+        })
+    }, |value| validate_chat_response(value, body, purpose))
+    .map_err(|failure| ChatFailure { retryable: failure.retryable, err: anyhow::Error::new(failure) })
+}
+
+/// 响应校验（HTTP 与 CLI Provider 共用）：有正文、摘要可解析、校对段落一一对应。
+fn validate_chat_response(value: &serde_json::Value, body: &serde_json::Value, purpose: &str) -> Result<()> {
+    {
         anyhow::ensure!(value.get("error").is_none_or(serde_json::Value::is_null), "AI 服务返回错误内容 / AI service returned an error");
         let content = value["choices"][0]["message"]["content"].as_str().filter(|s| !s.trim().is_empty()).context("AI 服务响应缺少正文 / AI response is missing message.content")?;
         if purpose == "summary" { anyhow::ensure!(crate::summarize::parse_summary(content).is_some(), "服务返回的摘要结构无效 / Invalid summary structure"); }
@@ -837,7 +896,7 @@ fn request_chat_once(
             anyhow::ensure!(segment_ids_match(&parsed, expected), "校对结果与原文段落不对应，已保留原文 / Proofread segments do not match the input");
         }
         Ok(())
-    }).map_err(|failure| ChatFailure { retryable: failure.retryable, err: anyhow::Error::new(failure) })
+    }
 }
 
 /// 发请求：可重试错误按指数退避重试，总共最多 [`MAX_ATTEMPTS`] 次尝试。

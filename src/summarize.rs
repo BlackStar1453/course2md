@@ -253,7 +253,7 @@ pub async fn summarize(
         "summary map-reduce"
     );
     let mut partials: Vec<Summary> = Vec::new();
-    for batch in chunks.chunks(SUMMARIZE_CONCURRENCY) {
+    for batch in chunks.chunks(SUMMARIZE_CONCURRENCY.min(crate::llm::effective_concurrency(s))) {
         let mut handles = Vec::with_capacity(batch.len());
         for (offset, chunk) in batch.iter().enumerate() {
             let t = format!("{ctx}{}", build_transcript(chunk));

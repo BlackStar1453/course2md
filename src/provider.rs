@@ -32,6 +32,8 @@ fn ensure_json_marker(content: &mut Value) {
 pub(crate) fn endpoint(s: &LlmSettings) -> String {
     match s.provider {
         LlmProvider::Codex => CODEX_RESPONSES_URL.into(),
+        // CLI Provider 没有网络地址；请求记录用它区分服务
+        LlmProvider::ClaudeCode => format!("cli://{}", s.provider.as_str()),
         _ => crate::llm::endpoint(&s.base_url),
     }
 }

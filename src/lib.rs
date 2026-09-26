@@ -4,6 +4,7 @@ pub mod asr;
 pub mod auth;
 pub mod checkpoint;
 pub mod cli;
+pub mod cli_provider;
 pub mod config;
 pub mod doctor;
 pub mod dispatch;
