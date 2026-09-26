@@ -153,20 +153,23 @@ impl CliRunner {
     ) -> Result<String, CliError> {
         let system = body["messages"][0]["content"].as_str().unwrap_or_default();
         let user = &body["messages"][1]["content"];
+        let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
+        // 每次调用独立的临时目录（返回即删除）：`cwd` 是空的工作目录（在 $HOME 之外，
+        // 不会读到任何 CLAUDE.md / AGENTS.md / 项目配置），其余是 Codex 的 schema 与截图文件
+        let scratch = tempfile::Builder::new()
+            .prefix("course2md-cli-")
+            .tempdir()
+            .map_err(|e| not_started(format!("无法创建临时目录 / Could not create a temp dir: {e}")))?;
+        let cwd = scratch.path().join("cwd");
+        std::fs::create_dir(&cwd).map_err(|e| not_started(format!("无法创建临时目录 / Could not create a temp dir: {e}")))?;
         match self.kind {
             CliKind::ClaudeCode => {
                 let mut cmd = Command::new(&self.binary);
                 cmd.args(claude_args(model, system, output_schema));
-                let stdin = claude_stdin(user);
-                let out = run(cmd, Some(stdin), timeout.unwrap_or(DEFAULT_TIMEOUT), cancelled)?;
+                let out = run(cmd, &cwd, Some(claude_stdin(user)), timeout, cancelled)?;
                 parse_claude(&out)
             }
             CliKind::CodexCli => {
-                // 本次调用的临时文件（schema、截图）；函数返回即删除
-                let scratch = tempfile::Builder::new()
-                    .prefix("course2md-codex-")
-                    .tempdir()
-                    .map_err(|e| not_started(format!("无法创建临时目录 / Could not create a temp dir: {e}")))?;
                 let (prompt, images) = codex_input(system, user, scratch.path())?;
                 let schema = match output_schema {
                     Some(schema) => {
@@ -177,10 +180,8 @@ impl CliRunner {
                     None => None,
                 };
                 let mut cmd = Command::new(&self.binary);
-                cmd.args(codex_args(model, schema.as_deref(), &images))
-                    .env_remove("OPENAI_API_KEY")
-                    .env_remove("CODEX_API_KEY");
-                let out = run(cmd, Some(prompt), timeout.unwrap_or(DEFAULT_TIMEOUT), cancelled)?;
+                cmd.args(codex_args(model, schema.as_deref(), &images));
+                let out = run(cmd, &cwd, Some(prompt), timeout, cancelled)?;
                 parse_codex(&out)
             }
         }
@@ -313,22 +314,28 @@ fn codex_input(system: &str, user: &Value, dir: &std::path::Path) -> Result<(Str
 /// Codex `exec --json` 事件流 → 最终文本（最后一条 agent_message）。
 fn parse_codex(out: &Output) -> Result<String, CliError> {
     let mut last: Option<String> = None;
+    let mut last_error: Option<String> = None;
     for line in out.stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else { continue };
         match event["type"].as_str() {
             Some("item.completed") if event["item"]["type"] == "agent_message" => {
                 last = event["item"]["text"].as_str().map(str::to_owned);
             }
-            Some("turn.failed") | Some("error") => {
-                let message = event["error"]["message"].as_str().or_else(|| event["message"].as_str()).unwrap_or_default();
+            Some("turn.failed") => {
+                let message = event["error"]["message"].as_str().unwrap_or_default();
                 return Err(failed(format!("Codex 返回错误 / Codex returned an error: {}", excerpt(message))));
+            }
+            // 重连等临时错误也会以 error 事件出现，之后仍可能正常答完；只在最终没有回答时报告
+            Some("error") => {
+                last_error = event["message"].as_str().or_else(|| event["error"]["message"].as_str()).map(str::to_owned);
             }
             _ => {}
         }
     }
-    match last.filter(|t| !t.trim().is_empty()) {
-        Some(text) => Ok(text),
-        None => Err(failed(format!("Codex 没有返回内容 / Codex returned no content{}", out.describe_exit()))),
+    match (last.filter(|t| !t.trim().is_empty()), last_error) {
+        (Some(text), _) => Ok(text),
+        (None, Some(error)) => Err(failed(format!("Codex 返回错误 / Codex returned an error: {}", excerpt(&error)))),
+        (None, None) => Err(failed(format!("Codex 没有返回内容 / Codex returned no content{}", out.describe_exit()))),
     }
 }
 
@@ -407,22 +414,32 @@ fn excerpt(text: &str) -> String {
     }
 }
 
-/// CLI 的工作目录：放在 $HOME 之外，避免加载用户的 CLAUDE.md / 项目配置。
-fn work_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("course2md-cli");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
+
+
+/// 会让调用绕开订阅（改用 API key 计费或别的服务端点）的环境变量；两种 CLI 都清掉。
+const OFF_SUBSCRIPTION_VARS: [&str; 8] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_API_KEY",
+];
 
 fn run(
     mut cmd: Command,
+    work_dir: &std::path::Path,
     stdin: Option<String>,
     timeout: Duration,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Output, CliError> {
-    cmd.current_dir(work_dir())
-        // 订阅额度：不让 API key 抢走计费；嵌套在 Claude Code 里运行时不继承会话标记
-        .env_remove("ANTHROPIC_API_KEY")
+    for var in OFF_SUBSCRIPTION_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.current_dir(work_dir)
+        // 嵌套在 Claude Code 里运行时不继承会话标记
         .env_remove("CLAUDECODE")
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())

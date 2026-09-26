@@ -361,3 +361,47 @@ fn stopping_the_cli_also_stops_programs_it_started() {
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(!pid_alive(pid), "grandchild {pid} still running");
 }
+
+/// A fake CLI that dumps its environment, then prints `stdout`.
+fn env_dumping_cli(dir: &Path, stdout: &str) -> PathBuf {
+    let out = dir.join("out.txt");
+    std::fs::write(&out, stdout).unwrap();
+    let script = dir.join("env-cli");
+    std::fs::write(&script, format!("#!/bin/sh\nenv > '{d}/env.txt'\ncat > /dev/null\ncat '{out}'\n", d = dir.display(), out = out.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// Variables that would move the call off the user's subscription (API keys, other endpoints).
+const OFF_SUBSCRIPTION_VARS: [&str; 8] = [
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX", "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY",
+];
+
+#[test]
+fn cli_calls_do_not_inherit_variables_that_bypass_the_subscription() {
+    for var in OFF_SUBSCRIPTION_VARS {
+        // SAFETY: only these otherwise-unused variables are set; no test here reads them.
+        unsafe { std::env::set_var(var, "set-by-test") };
+    }
+    for (kind, out) in [(CliKind::ClaudeCode, CLAUDE_OK), (CliKind::CodexCli, CODEX_OK)] {
+        let dir = tempfile::tempdir().unwrap();
+        CliRunner::new(kind, env_dumping_cli(dir.path(), out)).complete("m", &text_body(), None, None, &|| false).unwrap();
+        let env = std::fs::read_to_string(dir.path().join("env.txt")).unwrap();
+        for var in OFF_SUBSCRIPTION_VARS {
+            assert!(!env.lines().any(|l| l.starts_with(&format!("{var}="))), "{kind:?} inherited {var}");
+        }
+    }
+}
+
+#[test]
+fn codex_cli_recovers_from_a_transient_error_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = r#"{"type":"thread.started","thread_id":"t1"}
+{"type":"error","message":"Reconnecting... 1/5"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"segments\":[]}"}}
+{"type":"turn.completed","usage":{}}
+"#;
+    let runner = CliRunner::new(CliKind::CodexCli, fake_cli(dir.path(), out, 0));
+    assert_eq!(runner.complete("gpt-5.5", &text_body(), None, None, &|| false).unwrap(), r#"{"segments":[]}"#);
+}
