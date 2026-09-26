@@ -43,6 +43,7 @@ pub struct SingleChoiceGroup {
     disabled: bool,
     on_change: Option<Change>,
     reveal_in: Option<ScrollHandle>,
+    stack_below: Option<f32>,
 }
 impl SingleChoiceGroup {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
@@ -60,6 +61,7 @@ impl SingleChoiceGroup {
             disabled: false,
             on_change: None,
             reveal_in: None,
+            stack_below: None,
         }
     }
     pub fn options<K: Into<SharedString>, V: Into<SharedString>>(
@@ -93,6 +95,12 @@ impl SingleChoiceGroup {
     /// A top-level tab can also return from a detail view to its section root.
     pub fn activate_selected(mut self) -> Self {
         self.activate_selected = true;
+        self
+    }
+    /// 横排放不下就竖排：`available` 是这组选项可用的宽度（像素）。按当前字体实测
+    /// 标签宽度判断，而不是截断标签（字号放大、窗口变窄或选项较多时都适用）。
+    pub fn stack_if_narrower_than(mut self, available: f32) -> Self {
+        self.stack_below = Some(available);
         self
     }
     pub fn vertical(mut self) -> Self {
@@ -305,6 +313,10 @@ impl RenderOnce for SingleChoiceGroup {
                 (f32::from(width.ceil()) + padding + 4. + icon_and_gap).ceil()
             })
             .fold(0_f32, f32::max);
+        let vertical = vertical
+            || self
+                .stack_below
+                .is_some_and(|available| slot_width * count as f32 + inset * 2. > available);
         let mut lane = gpui_base::h_flex()
             .relative()
             .w_full()
@@ -439,7 +451,9 @@ impl RenderOnce for SingleChoiceGroup {
             .min_w_0()
             .max_w_full()
             .p(px(inset))
-            .rounded_full()
+            // 竖排时整体 rounded_full 会把发丝边画成一个大椭圆；改为与胶囊选项同心的圆角
+            .when(!vertical, |group| group.rounded_full())
+            .when(vertical, |group| group.rounded(item_height / 2. + px(inset)))
             // 轨道用内嵌面色（与输入框同一 recessed 语义）：4.5% 混合在深色下与卡片底无法区分，
             // 导致「选中段跳出轨道」的错觉（system.md：角色映射失败应在共享层修正）。
             // 页面底色与 INSET 几乎相同，单靠填充在页面背景上轨道会消失（reader 页签、
@@ -562,6 +576,26 @@ mod tests {
                         this.changes += 1;
                         cx.notify();
                     })),
+            )
+        }
+    }
+
+    /// Five AI service kinds in a pane whose width the test controls.
+    struct CrowdedHarness {
+        width: Pixels,
+    }
+
+    const SERVICE_KINDS: [&str; 5] = ["OpenAI 兼容服务", "Ollama 本地服务", "Codex 账号", "Claude Code", "Codex CLI"];
+
+    impl Render for CrowdedHarness {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            window.set_rem_size(px(14.));
+            div().w(self.width).child(
+                SingleChoiceGroup::new("crowded-choice", "AI 服务类型")
+                    .options(SERVICE_KINDS.map(|label| (label, label)))
+                    .selected(SERVICE_KINDS[0])
+                    .full_width()
+                    .stack_if_narrower_than(f32::from(self.width)),
             )
         }
     }
@@ -850,5 +884,23 @@ mod tests {
         assert_eq!(destination(&enabled, Some(1), Direction::First), Some(0));
         assert_eq!(destination(&enabled, Some(1), Direction::Last), Some(3));
         assert_eq!(destination(&[], Some(0), Direction::Next), None);
+    }
+
+    /// Options that do not fit side by side are stacked rather than cut short.
+    #[gpui::test]
+    fn crowded_choices_stack_instead_of_truncating(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| CrowdedHarness { width: px(320.) });
+        draw_choice(cx);
+        let first = choice_bounds(cx, "full-choice-option-0");
+        let second = choice_bounds(cx, "full-choice-option-1");
+        assert!(second.top() >= first.bottom(), "a narrow pane must stack the options");
+        assert!(second.left() == first.left());
+
+        let (_, cx) = cx.add_window_view(|_, _| CrowdedHarness { width: px(1400.) });
+        draw_choice(cx);
+        let first = choice_bounds(cx, "full-choice-option-0");
+        let second = choice_bounds(cx, "full-choice-option-1");
+        assert_eq!(second.top(), first.top(), "wide pane keeps one row");
+        assert!(second.left() > first.left());
     }
 }

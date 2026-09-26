@@ -36,6 +36,10 @@ pub enum LlmProvider {
     Ollama,
     /// OpenAI Codex 订阅登录（ChatGPT 后端 Responses API）
     Codex,
+    /// 本机 Claude Code CLI（`claude -p`，走 Claude 订阅）
+    ClaudeCode,
+    /// 本机 Codex CLI（`codex exec`，走 ChatGPT 订阅；登录态由 Codex CLI 自己管理）
+    CodexCli,
 }
 
 impl LlmProvider {
@@ -44,6 +48,8 @@ impl LlmProvider {
             Self::OpenAiCompatible => "openai-compatible",
             Self::Ollama => "ollama",
             Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+            Self::CodexCli => "codex-cli",
         }
     }
 }
@@ -105,7 +111,8 @@ pub fn endpoint(base_url: &str) -> String {
 
 /// 校验配置可直接使用。
 pub fn validate(s: &LlmSettings) -> Result<()> {
-    if s.provider != LlmProvider::Codex && s.base_url.trim().is_empty() {
+    let keyless = s.provider == LlmProvider::Codex || crate::cli_provider::CliKind::of(s.provider).is_some();
+    if !keyless && s.base_url.trim().is_empty() {
         bail!("未配置 LLM 服务地址。 / LLM base URL is missing. Run: course2md llm setup");
     }
     if s.model.trim().is_empty() {
@@ -121,6 +128,25 @@ pub fn validate(s: &LlmSettings) -> Result<()> {
 const DEFAULT_CONCURRENCY: usize = 8;
 /// 润色并发上限：再高对端点限流没有好处，只放大 429 风险
 const MAX_CONCURRENCY: usize = 16;
+/// CLI Provider 默认并发：每次调用都要启动进程，且共享同一份订阅额度。
+const CLI_DEFAULT_CONCURRENCY: usize = 2;
+/// CLI Provider 并发上限。
+const CLI_MAX_CONCURRENCY: usize = 4;
+
+/// 实际并发数。CLI Provider 未调整过（仍是 HTTP 默认值）时用 2，最多 4。
+/// 配置里只存一个数字，无法区分「没设置」与「明确设为 8」；后者对 CLI 也按 2 处理
+///（在上限 4 以内，不会超额），换来配置格式与上游保持兼容。
+pub fn effective_concurrency(s: &LlmSettings) -> usize {
+    if crate::cli_provider::CliKind::of(s.provider).is_some() {
+        if s.concurrency == DEFAULT_CONCURRENCY {
+            CLI_DEFAULT_CONCURRENCY
+        } else {
+            s.concurrency.clamp(1, CLI_MAX_CONCURRENCY)
+        }
+    } else {
+        s.concurrency.clamp(1, MAX_CONCURRENCY)
+    }
+}
 /// LLM 请求最大尝试次数（1 次原始 + 重试）。
 const MAX_ATTEMPTS: usize = 3;
 
@@ -142,7 +168,7 @@ pub(crate) const CHAT_MAX_TOKENS: u32 = 16384;
 /// 构造标准 chat/completions 请求体（temperature=0、json_object 结构化输出）。
 /// 润色与总结共用，避免两处各自拼 body 参数漂移；
 /// `user` 传 &str 为纯文本消息，传 `serde_json::Value::Array` 为多模态内容块。
-pub(crate) fn chat_body(
+pub fn chat_body(
     model: &str,
     system: &str,
     user: impl Into<serde_json::Value>,
@@ -199,7 +225,7 @@ pub fn polish_sections_report(
         return Ok(PolishReport::default());
     }
     let warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let workers = s.concurrency.clamp(1, MAX_CONCURRENCY);
+    let workers = effective_concurrency(s);
     // 整个任务共享一个 agent（连接池复用 TCP+TLS），不再每请求新建
     let agent = chat_agent();
     let succeeded = std::sync::atomic::AtomicUsize::new(0);
@@ -800,6 +826,9 @@ fn request_chat_once(
     description: &str,
 ) -> std::result::Result<serde_json::Value, ChatFailure> {
     let url = crate::provider::endpoint(s);
+    if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
+        return request_cli_once(kind, s, body, purpose, description, &url);
+    }
     let headers = crate::provider::auth_headers(s).map_err(|err| ChatFailure {
         retryable: false,
         err,
@@ -826,7 +855,79 @@ fn request_chat_once(
             });
         }
         Ok(response)
-    }, |value| {
+    }, |value| validate_chat_response(value, body, purpose)).map_err(|failure| ChatFailure { retryable: failure.retryable, err: anyhow::Error::new(failure) })
+}
+
+/// CLI Provider 的一次请求：启动 CLI，把最终文本包成 chat/completions 响应，
+/// 走与 HTTP 相同的请求记录与响应校验。进程没起来 = 请求确定未发出。
+fn request_cli_once(
+    kind: crate::cli_provider::CliKind,
+    s: &LlmSettings,
+    body: &serde_json::Value,
+    purpose: &str,
+    description: &str,
+    url: &str,
+) -> std::result::Result<serde_json::Value, ChatFailure> {
+    let runner = crate::cli_provider::CliRunner::locate(kind).map_err(|err| ChatFailure {
+        retryable: false,
+        err: anyhow::Error::new(err),
+    })?;
+    crate::dispatch::json_request_described("llm", purpose, description, url, body, || {
+        let wrapped = match runner.complete(&s.model, body, output_schema(purpose).as_ref(), None, &|| {
+            crate::dispatch::check_control().is_err()
+        }) {
+            Ok(text) => serde_json::json!({"choices": [{"message": {"role": "assistant", "content": text}}]}),
+            // CLI 已退出并报告失败：结果确定，记为该批失败（保留原文），不冻结其他请求
+            Err(e) if e.finished => serde_json::json!({"error": {"message": e.message, "source": "cli"}}),
+            // 没起来 = 未发出；被我们中止 = 结果不确定，交给请求记录按原规则处理
+            Err(e) => {
+                return Err(crate::dispatch::NetworkFailure {
+                    message: e.message,
+                    definitely_unsent: e.not_started,
+                });
+            }
+        };
+        Ok(crate::dispatch::HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&wrapped).unwrap_or_default(),
+        })
+    }, |value| validate_chat_response(value, body, purpose))
+    .map_err(|failure| ChatFailure { retryable: failure.retryable, err: anyhow::Error::new(failure) })
+}
+
+/// CLI Provider 的输出结构约束（与 HTTP 的 json_object 契约同义，Codex 原生强制）。
+fn output_schema(purpose: &str) -> Option<serde_json::Value> {
+    let text = serde_json::json!({"type": "string"});
+    match purpose {
+        "proofreading" => Some(serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["segments"],
+            "properties": {"segments": {"type": "array", "items": {
+                "type": "object", "additionalProperties": false, "required": ["id", "text"],
+                "properties": {"id": {"type": "integer"}, "text": text},
+            }}},
+        })),
+        "summary" => Some(serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["tldr", "key_points", "outline"],
+            "properties": {
+                "tldr": text,
+                "key_points": {"type": "array", "items": text},
+                "outline": {"type": "array", "items": {
+                    "type": "object", "additionalProperties": false, "required": ["t", "title", "detail"],
+                    "properties": {"t": {"type": "number"}, "title": text, "detail": text},
+                }},
+            },
+        })),
+        _ => None,
+    }
+}
+
+/// 响应校验（HTTP 与 CLI Provider 共用）：有正文、摘要可解析、校对段落一一对应。
+fn validate_chat_response(value: &serde_json::Value, body: &serde_json::Value, purpose: &str) -> Result<()> {
+    {
+        // 本机 CLI 的错误信息不含服务端回显的凭据，可以原样保留，便于排查
+        if value["error"]["source"] == "cli" {
+            anyhow::bail!("{}", value["error"]["message"].as_str().unwrap_or_default());
+        }
         anyhow::ensure!(value.get("error").is_none_or(serde_json::Value::is_null), "AI 服务返回错误内容 / AI service returned an error");
         let content = value["choices"][0]["message"]["content"].as_str().filter(|s| !s.trim().is_empty()).context("AI 服务响应缺少正文 / AI response is missing message.content")?;
         if purpose == "summary" { anyhow::ensure!(crate::summarize::parse_summary(content).is_some(), "服务返回的摘要结构无效 / Invalid summary structure"); }
@@ -837,7 +938,7 @@ fn request_chat_once(
             anyhow::ensure!(segment_ids_match(&parsed, expected), "校对结果与原文段落不对应，已保留原文 / Proofread segments do not match the input");
         }
         Ok(())
-    }).map_err(|failure| ChatFailure { retryable: failure.retryable, err: anyhow::Error::new(failure) })
+    }
 }
 
 /// 发请求：可重试错误按指数退避重试，总共最多 [`MAX_ATTEMPTS`] 次尝试。
@@ -913,6 +1014,16 @@ pub fn test_connection(s: &LlmSettings) -> Result<()> {
     } else {
         serde_json::Value::String("只回复两个字符：ok".into())
     };
+    if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
+        let runner = crate::cli_provider::CliRunner::locate(kind)?;
+        let body = chat_body(&s.model, "", user, 512);
+        let text = runner.complete(&s.model, &body, None, None, &|| false)?;
+        println!("{}: {}", runner.binary().display(), text.trim());
+        if s.vision {
+            println!("已测试图片输入。 / Image input tested.");
+        }
+        return Ok(());
+    }
     let body = crate::provider::test_body(s, user);
     let fail_hint = if s.vision {
         "连接失败。请确认服务地址、密钥及模型，并检查图片输入支持。 / Connection failed. Check the URL, API key, model, and image input support."
@@ -961,6 +1072,7 @@ pub fn test_connection(s: &LlmSettings) -> Result<()> {
 /// 退格/删除等标准编辑键——裸 read_line 无法处理方向键转义序列（issue #3）。
 pub fn setup_interactive(
     mut cfg: crate::settings::ConfigFile,
+    provider: Option<LlmProvider>,
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
@@ -974,6 +1086,29 @@ pub fn setup_interactive(
             v.trim().to_string()
         }
     };
+    // 未指定时交互终端里选择；脚本调用保持原行为（OpenAI 兼容端点）
+    let provider = match provider {
+        Some(p) => p,
+        None if interactive => {
+            let choices = [
+                (LlmProvider::OpenAiCompatible, "OpenAI 兼容服务（API key） / OpenAI-compatible service (API key)"),
+                (LlmProvider::ClaudeCode, "Claude Code（本机 claude，Claude 订阅） / Claude Code (local claude, Claude subscription)"),
+                (LlmProvider::CodexCli, "Codex CLI（本机 codex，ChatGPT 订阅） / Codex CLI (local codex, ChatGPT subscription)"),
+            ];
+            let current = choices.iter().position(|(p, _)| *p == cfg.llm.provider).unwrap_or(0);
+            let picked = dialoguer::Select::new()
+                .with_prompt("服务类型 / Provider")
+                .items(choices.map(|(_, label)| label))
+                .default(current)
+                .interact_opt()?
+                .ok_or_else(|| anyhow::anyhow!("已取消设置，未保存配置。 / Setup cancelled; no configuration saved."))?;
+            choices[picked].0
+        }
+        None => LlmProvider::OpenAiCompatible,
+    };
+    if crate::cli_provider::CliKind::of(provider).is_some() {
+        return setup_cli_provider(cfg, provider, model, disable_hint, interactive);
+    }
     if let Some(v) = base_url {
         cfg.llm.base_url = v.trim().to_string();
     } else if interactive {
@@ -1039,6 +1174,45 @@ pub fn setup_interactive(
     Ok(cfg)
 }
 
+/// CLI Provider：不需要服务地址和密钥，只定模型（默认 sonnet / gpt-5.5）。
+fn setup_cli_provider(
+    mut cfg: crate::settings::ConfigFile,
+    provider: LlmProvider,
+    model: Option<String>,
+    disable_hint: bool,
+    interactive: bool,
+) -> Result<crate::settings::ConfigFile> {
+    let default_model = crate::cli_provider::CliKind::of(provider)
+        .map_or("", crate::cli_provider::CliKind::default_model);
+    let keep = cfg.llm.provider == provider && !cfg.llm.model.trim().is_empty();
+    let current = if keep { cfg.llm.model.clone() } else { default_model.to_string() };
+    cfg.llm.model = match model {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ if interactive => {
+            let v: String = dialoguer::Input::new()
+                .with_prompt("模型名 / Model name")
+                .with_initial_text(&current)
+                .allow_empty(true)
+                .interact_text()?;
+            if v.trim().is_empty() { current } else { v.trim().to_string() }
+        }
+        _ => current,
+    };
+    if interactive {
+        cfg.llm.vision = dialoguer::Select::new()
+            .with_prompt("润色时附上幻灯片截图？ / Attach slide images when polishing?")
+            .items(["仅发送文字 / Send text only", "发送文字和截图 / Send text and slide images"])
+            .default(if cfg.llm.vision { 1 } else { 0 })
+            .interact_opt()?
+            .ok_or_else(|| anyhow::anyhow!("已取消设置，未保存配置。 / Setup cancelled; no configuration saved."))? == 1;
+    }
+    cfg.llm.provider = provider;
+    validate(&cfg.llm)?;
+    cfg.llm.disable_hint |= disable_hint;
+    cfg.llm.enabled = true;
+    Ok(cfg)
+}
+
 pub fn print_status(cfg: &crate::settings::ConfigFile) {
     let s = &cfg.llm;
     let state = |enabled| {
@@ -1079,7 +1253,13 @@ pub fn print_status(cfg: &crate::settings::ConfigFile) {
         state(s.vision)
     );
     println!("  自动总结 / Automatic summary: {}", state(s.summarize));
-    println!("  并发请求 / Concurrent requests: {}", s.concurrency);
+    if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
+        match crate::cli_provider::CliRunner::locate(kind) {
+            Ok(runner) => println!("  CLI 程序 / CLI program: {}", runner.binary().display()),
+            Err(e) => println!("  CLI 程序 / CLI program: {e}"),
+        }
+    }
+    println!("  并发请求 / Concurrent requests: {}", effective_concurrency(s));
     println!("  使用提示 / Usage hint: {}", state(!s.disable_hint));
     if !s.enabled {
         println!("开启润色 / Enable transcript polish: course2md llm setup");

@@ -20,6 +20,9 @@ fn resolve_llm(opts: &RunOpts, file: &settings::ConfigFile) -> llm::LlmSettings 
     } else if opts.llm_vision {
         s.vision = true;
     }
+    if let Some(p) = opts.llm_provider {
+        s.provider = p;
+    }
     if let Some(v) = &opts.llm_base_url {
         s.base_url = v.clone();
     }
@@ -199,6 +202,18 @@ mod tests {
             .unwrap()
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn cli_provider_flag_overrides_config_for_one_run() {
+        let mut file = settings::ConfigFile::default();
+        file.llm.provider = crate::llm::LlmProvider::OpenAiCompatible;
+        let opts = RunOpts {
+            llm_provider: Some(crate::llm::LlmProvider::CodexCli),
+            ..Default::default()
+        };
+        let cfg = resolve("video".into(), &opts, &file).unwrap();
+        assert_eq!(cfg.llm.provider, crate::llm::LlmProvider::CodexCli);
     }
 
     #[test]

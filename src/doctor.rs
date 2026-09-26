@@ -59,6 +59,20 @@ pub fn run() -> Result<()> {
         Some(version) => check(&mut out, true, "yt-dlp", &format!("  {version}")),
         None => out.push("- yt-dlp  远程视频需要，本地文件不需要 / Required for URLs, optional for local files: brew install yt-dlp (macOS); pipx install yt-dlp".into()),
     }
+    // AI 润色可选的 CLI Provider（订阅额度，不需要 API key）
+    for kind in [crate::cli_provider::CliKind::ClaudeCode, crate::cli_provider::CliKind::CodexCli] {
+        match crate::cli_provider::CliRunner::locate(kind) {
+            Ok(runner) => {
+                let version = tool_version(&runner.binary().to_string_lossy(), &["--version"]).unwrap_or_default();
+                check(&mut out, true, kind.program(), &format!("  {}  {version}", runner.binary().display()));
+            }
+            Err(_) => out.push(format!(
+                "- {program}  AI 润色可选（使用本机订阅）；未找到，可用 {var} 指定 / Optional for AI proofreading with your subscription; not found, set {var} to point at it",
+                program = kind.program(),
+                var = kind.env_override(),
+            )),
+        }
+    }
     #[cfg(apple_native)]
     {
         // 与运行时 ensure_metallib 同一搜索清单（exe 同目录/Resources/上级 Resources/CWD）

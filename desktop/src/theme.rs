@@ -355,6 +355,37 @@ pub fn supporting_info(
         )
 }
 
+/// supporting_info for an actionable problem or a consequence of the current choice:
+/// same placement and size, warning icon and status color.
+pub fn supporting_warning(
+    id: impl Into<gpui::ElementId>,
+    text: impl Into<gpui::SharedString>,
+) -> gpui::Div {
+    use gpui::{prelude::*, *};
+    div()
+        .flex()
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap(rems(8. / 14.))
+        .child(
+            crate::icons::warning()
+                .size(rems(16. / 14.))
+                .mt(rems(1. / 14.))
+                .flex_shrink_0()
+                .text_color(color(WARNING)),
+        )
+        .child(
+            accessible_text(id, text)
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .text_size(TEXT_AUX)
+                .line_height(rems(18. / 14.))
+                .text_color(color(WARNING)),
+        )
+}
+
 /// Standalone guidance has its own boundary. Inside a setting, use supporting_info.
 pub fn info_callout(
     id: impl Into<gpui::ElementId>,

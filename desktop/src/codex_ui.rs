@@ -11,6 +11,10 @@ use gpui_component::button::ButtonVariants as _;
 pub(crate) const ENDPOINT_NOTE: &str =
     "请求固定发往 OpenAI Codex 后端；无需服务地址与 API Key。";
 
+/// 选择 Codex 账号的后果（ADR 0001）：与说明分开，用警告样式展示。
+pub(crate) const SIGN_IN_RISK: &str =
+    "会复制并自行刷新本机 Codex 登录，可能让本机 Codex CLI 需要重新登录；已安装 Codex CLI 时建议改选「Codex CLI」。";
+
 /// 识别根 crate 的登录缺失/失效标记，替换为界面内的连接引导。
 fn login_required(error: &anyhow::Error) -> bool {
     error

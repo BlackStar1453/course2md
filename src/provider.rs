@@ -4,6 +4,9 @@
 //! OpenAiCompatible 与 Ollama 共用 chat/completions 方言；Codex 走 ChatGPT 后端
 //! Responses API（SSE 流），SSE 聚合为 chat/completions 形状的 JSON 后，
 //! 下游校验与解析逻辑保持不变。
+//!
+//! 例外：CLI Provider（Claude Code / Codex CLI）不走 HTTP，其调用参数、输入转换与
+//! 输出解析集中在 crate::cli_provider；本文件只给它们一个 `cli://` 标识用于请求记录。
 
 use anyhow::{Result, bail, ensure};
 use serde_json::Value;
@@ -32,6 +35,8 @@ fn ensure_json_marker(content: &mut Value) {
 pub(crate) fn endpoint(s: &LlmSettings) -> String {
     match s.provider {
         LlmProvider::Codex => CODEX_RESPONSES_URL.into(),
+        // CLI Provider 没有网络地址；请求记录用它区分服务
+        LlmProvider::ClaudeCode | LlmProvider::CodexCli => format!("cli://{}", s.provider.as_str()),
         _ => crate::llm::endpoint(&s.base_url),
     }
 }

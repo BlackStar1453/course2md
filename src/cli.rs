@@ -208,6 +208,11 @@ pub struct RunOpts {
     #[arg(help_heading = "AI 润色 / AI proofreading")]
     pub no_llm: bool,
 
+    /// 本次使用的 AI 服务类型 / AI provider for this run
+    #[arg(long, value_enum)]
+    #[arg(help_heading = "AI 润色 / AI proofreading")]
+    pub llm_provider: Option<crate::llm::LlmProvider>,
+
     /// AI 润色服务地址 / AI proofreading base URL (OpenAI-compatible)
     #[arg(long)]
     #[arg(help_heading = "AI 润色 / AI proofreading")]
@@ -373,6 +378,9 @@ pub enum ModelsCmd {
 pub enum LlmCmd {
     /// 配置并启用 AI 润色（终端内询问缺失项）/ Set up AI proofreading; prompts in a terminal
     Setup {
+        /// 服务类型（claude-code / codex-cli 使用本机 CLI 与订阅，无需地址和密钥）/ Provider (claude-code / codex-cli use the local CLI and subscription; no URL or key)
+        #[arg(long, value_enum)]
+        provider: Option<crate::llm::LlmProvider>,
         #[arg(long)]
         base_url: Option<String>,
         #[arg(long)]

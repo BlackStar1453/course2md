@@ -111,8 +111,8 @@ pub fn test_service_blocking(
     run_test(config, kind, vault, cancelled, &HttpTransport)
 }
 
-/// Codex 订阅服务的检查：复用 CLI 的 Responses/SSE 方言（course2md::llm::test_connection），
-/// 桌面自带的 chat/completions 传输不适用于 Codex。证据模型与其他服务一致；
+/// 订阅类服务（Codex、本机 Claude Code / Codex CLI）的检查：复用核心的
+/// course2md::llm::test_connection，桌面自带的 chat/completions 传输不适用于它们。证据模型与其他服务一致；
 /// 校对结构契约由转换流程在运行时复核（失败保留原文）。
 pub fn test_codex_blocking(
     config: &ServiceConfiguration,
@@ -126,10 +126,24 @@ pub fn test_codex_blocking(
         outcome: TestOutcome::NotSent,
         message: String::new(),
         details: vec![
-            format!("用途：{}；Codex 连接检查（登录态与模型可用性）", kind.label()),
+            format!("用途：{}；{}连接检查（登录态与模型可用性）", kind.label(), subscription_name(config.protocol)),
             format!("请求模型：{}", config.model),
         ],
     };
+    // 本机 CLI：先确认找到程序，并把实际使用的程序路径记进详情
+    if let Some(cli) = config.protocol.cli_kind() {
+        match course2md::cli_provider::CliRunner::locate(cli) {
+            Ok(runner) => evidence.details.push(format!("本机程序：{}", runner.binary().display())),
+            Err(error) => {
+                evidence.outcome = codex_failure_outcome(&anyhow::Error::new(error.clone()));
+                evidence.message = format!(
+                    "找不到本机 {}，请先安装并登录；尚未发送请求",
+                    cli.program()
+                );
+                return evidence;
+            }
+        }
+    }
     if cancelled.load(Ordering::Acquire) {
         evidence.message = "测试已取消，尚未发送请求".into();
         return evidence;
@@ -140,7 +154,7 @@ pub fn test_codex_blocking(
     }
     let settings = course2md::llm::LlmSettings {
         enabled: true,
-        provider: course2md::llm::LlmProvider::Codex,
+        provider: config.protocol.llm_provider(),
         model: config.model.clone(),
         vision: kind == TestKind::Vision,
         ..Default::default()
@@ -148,7 +162,7 @@ pub fn test_codex_blocking(
     match course2md::llm::test_connection(&settings) {
         Ok(()) => {
             evidence.outcome = TestOutcome::Passed;
-            evidence.message = "连接测试通过：Codex 登录与模型可用".into();
+            evidence.message = format!("连接测试通过：{}登录与模型可用", subscription_name(config.protocol));
             evidence
                 .details
                 .push("仅验证登录态、模型与图文输入路径，不代表所有内容均可校对".into());
@@ -157,7 +171,7 @@ pub fn test_codex_blocking(
             let outcome = codex_failure_outcome(&error);
             let reason = format!("{error:#}");
             evidence.message = if outcome == TestOutcome::AuthenticationRefused {
-                "Codex 登录已失效或尚未连接，请重新连接账号".into()
+                format!("{}登录已失效或尚未连接，请重新连接账号", subscription_name(config.protocol))
             } else {
                 format!("连接测试未通过：{}", reason.chars().take(240).collect::<String>())
             };
@@ -167,9 +181,25 @@ pub fn test_codex_blocking(
     evidence
 }
 
-/// Codex 检查失败的分类：登录缺失/失效（含刷新被拒）是配置拒绝，阻断补做；
-/// 其余为一般性未通过。识别根 crate 的 [`course2md::login::codex::CodexLoginRequired`] 标记。
+/// 订阅类服务在检查详情里的称呼。
+fn subscription_name(protocol: ServiceProtocol) -> &'static str {
+    match protocol {
+        ServiceProtocol::ClaudeCodeCli => "Claude Code ",
+        ServiceProtocol::CodexCli => "Codex CLI ",
+        _ => "Codex ",
+    }
+}
+
+/// 订阅类服务检查失败的分类：登录缺失/失效（含刷新被拒）是配置拒绝，阻断补做；
+/// 找不到本机程序时请求并未发出；其余为一般性未通过。
+/// 识别根 crate 的 [`course2md::login::codex::CodexLoginRequired`] 与 [`course2md::cli_provider::CliError`]。
 fn codex_failure_outcome(error: &anyhow::Error) -> TestOutcome {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<course2md::cli_provider::CliError>().is_some_and(|e| e.not_started))
+    {
+        return TestOutcome::NotSent;
+    }
     if error
         .chain()
         .any(|cause| cause.downcast_ref::<course2md::login::codex::CodexLoginRequired>().is_some())
@@ -845,6 +875,21 @@ mod tests {
         );
         // 标记与 CLI 修复文案都不含凭据
         assert!(!format!("{expired:#}").contains("--login"));
+    }
+
+    #[test]
+    fn a_missing_local_cli_means_nothing_was_sent() {
+        let missing = course2md::cli_provider::CliRunner::locate_in(
+            course2md::cli_provider::CliKind::ClaudeCode,
+            std::ffi::OsStr::new(""),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            codex_failure_outcome(&anyhow::Error::new(missing)),
+            TestOutcome::NotSent,
+            "找不到本机程序时请求并未发出"
+        );
     }
 
     #[test]
