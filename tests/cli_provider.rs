@@ -243,3 +243,57 @@ fn codex_cli_failed_turn_is_reported() {
     let err = runner.complete("gpt-5.5", &text_body(), None, None, &|| false).unwrap_err();
     assert!(err.message.contains("usage limit"), "{}", err.message);
 }
+
+/// A fake Codex that also keeps a copy of every `--image=` file it was given.
+fn fake_codex_keeping_images(dir: &Path) -> PathBuf {
+    let out = dir.join("out.txt");
+    std::fs::write(&out, CODEX_OK).unwrap();
+    let script = dir.join("fake-codex");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{d}/argv.txt'\nn=0\nfor a in \"$@\"; do case \"$a\" in --image=*) cp \"${{a#--image=}}\" '{d}'/seen-$n; n=$((n+1));; esac; done\ncat > /dev/null\ncat '{out}'\n",
+            d = dir.display(),
+            out = out.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn screenshot_body(bytes: &[u8]) -> serde_json::Value {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    chat_body("sys", serde_json::json!([
+        {"type": "text", "text": "[{\"id\":0,\"text\":\"x\"}]"},
+        {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{b64}")}},
+    ]))
+}
+
+#[test]
+fn claude_code_receives_the_screenshot_as_an_image_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = CliRunner::new(CliKind::ClaudeCode, fake_cli(dir.path(), CLAUDE_OK, 0));
+    runner.complete("sonnet", &screenshot_body(b"\xFF\xD8jpeg-bytes"), None, None, &|| false).unwrap();
+
+    let stdin = std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap();
+    let msg: serde_json::Value = serde_json::from_str(stdin.lines().next().unwrap()).unwrap();
+    let image = &msg["message"]["content"][1];
+    assert_eq!(image["type"], "image");
+    assert_eq!(image["source"]["media_type"], "image/jpeg");
+    assert_eq!(image["source"]["data"], "/9hqcGVnLWJ5dGVz");
+}
+
+#[test]
+fn codex_cli_gets_the_screenshot_as_a_file_that_is_removed_afterwards() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = CliRunner::new(CliKind::CodexCli, fake_codex_keeping_images(dir.path()));
+    runner.complete("gpt-5.5", &screenshot_body(b"\xFF\xD8jpeg-bytes"), None, None, &|| false).unwrap();
+
+    assert_eq!(std::fs::read(dir.path().join("seen-0")).unwrap(), b"\xFF\xD8jpeg-bytes");
+    let args = argv(dir.path());
+    let image_arg = args.iter().find(|a| a.starts_with("--image=")).unwrap();
+    assert!(!Path::new(image_arg.trim_start_matches("--image=")).exists(), "temp screenshot left behind");
+    assert_eq!(args.last().map(String::as_str), Some("-"));
+}
