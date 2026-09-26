@@ -405,3 +405,33 @@ fn codex_cli_recovers_from_a_transient_error_event() {
     let runner = CliRunner::new(CliKind::CodexCli, fake_cli(dir.path(), out, 0));
     assert_eq!(runner.complete("gpt-5.5", &text_body(), None, None, &|| false).unwrap(), r#"{"segments":[]}"#);
 }
+
+/// Finder-launched apps get a minimal PATH; npm's `codex`/`claude` wrappers then run
+/// `node`, which lives next to them or in a common install directory.
+#[test]
+fn the_cli_can_find_programs_installed_next_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("pnpm");
+    std::fs::create_dir(&bin).unwrap();
+    let out = dir.path().join("out.txt");
+    std::fs::write(&out, CLAUDE_OK).unwrap();
+    let script = bin.join("claude");
+    std::fs::write(&script, format!("#!/bin/sh\necho \"$PATH\" > '{d}/path.txt'\ncat > /dev/null\ncat '{o}'\n", d = dir.path().display(), o = out.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    CliRunner::new(CliKind::ClaudeCode, &script).complete("m", &text_body(), None, None, &|| false).unwrap();
+
+    let path = std::fs::read_to_string(dir.path().join("path.txt")).unwrap();
+    let entries: Vec<&str> = path.trim().split(':').collect();
+    assert!(entries.contains(&bin.to_str().unwrap()), "{path}");
+    assert!(entries.contains(&"/opt/homebrew/bin"), "{path}");
+}
+
+#[test]
+fn locating_without_the_override_only_searches_the_given_places() {
+    let root = tempfile::tempdir().unwrap();
+    exe(&root.path().join("bin/codex"));
+    let path = std::ffi::OsString::from(root.path().join("bin"));
+    let runner = CliRunner::locate_in(CliKind::CodexCli, &path, None).unwrap();
+    assert_eq!(runner.binary(), root.path().join("bin/codex"));
+}

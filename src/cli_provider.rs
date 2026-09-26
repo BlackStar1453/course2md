@@ -62,6 +62,11 @@ impl CliKind {
 
 /// 在 PATH 与常见安装目录中找可执行文件（PATH 优先）。
 pub fn find_binary(program: &str, path: &std::ffi::OsStr, home: Option<&std::path::Path>) -> Option<PathBuf> {
+    search_dirs(path, home).into_iter().map(|d| d.join(program)).find(|p| is_executable(p))
+}
+
+/// PATH 加上常见安装目录（从 Finder 启动的程序只拿到很短的 PATH）。
+fn search_dirs(path: &std::ffi::OsStr, home: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
     if let Some(home) = home {
         for rel in [".local/bin", ".claude/local", "Library/pnpm", ".npm-global/bin", ".bun/bin", ".volta/bin", ".cargo/bin"] {
@@ -69,7 +74,20 @@ pub fn find_binary(program: &str, path: &std::ffi::OsStr, home: Option<&std::pat
         }
     }
     dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    dirs.into_iter().map(|d| d.join(program)).find(|p| is_executable(p))
+    dirs
+}
+
+/// 给 CLI 子进程的 PATH：程序所在目录优先，再加原 PATH 与常见安装目录。
+/// npm 装的 claude / codex 是包装脚本，要靠 PATH 找到 node。
+fn child_path(binary: &std::path::Path) -> std::ffi::OsString {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> = binary.parent().map(std::path::Path::to_path_buf).into_iter().collect();
+    for dir in search_dirs(&std::env::var_os("PATH").unwrap_or_default(), home.as_deref()) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_default()
 }
 
 fn is_executable(path: &std::path::Path) -> bool {
@@ -146,7 +164,12 @@ impl CliRunner {
                 )))
             };
         }
-        let found = find_binary(kind.program(), &path, home.as_deref());
+        Self::locate_in(kind, &path, home.as_deref())
+    }
+
+    /// 只在给定的 PATH 与 home 下常见安装目录里找（不看环境变量里的手动指定）。
+    pub fn locate_in(kind: CliKind, path: &std::ffi::OsStr, home: Option<&std::path::Path>) -> Result<Self, CliError> {
+        let found = find_binary(kind.program(), path, home);
         found.map(|binary| Self::new(kind, binary)).ok_or_else(|| not_started(format!(
                 "找不到 {program}，请先安装并登录，或用 {var} 指定路径 / {program} not found; install and sign in first, or set {var}",
                 program = kind.program(),
@@ -182,7 +205,7 @@ impl CliRunner {
         match self.kind {
             CliKind::ClaudeCode => {
                 let mut cmd = Command::new(&self.binary);
-                cmd.args(claude_args(model, system, output_schema));
+                cmd.env("PATH", child_path(&self.binary)).args(claude_args(model, system, output_schema));
                 let out = run(cmd, &cwd, Some(claude_stdin(user)), timeout, cancelled)?;
                 parse_claude(&out)
             }
@@ -197,7 +220,7 @@ impl CliRunner {
                     None => None,
                 };
                 let mut cmd = Command::new(&self.binary);
-                cmd.args(codex_args(model, schema.as_deref(), &images));
+                cmd.env("PATH", child_path(&self.binary)).args(codex_args(model, schema.as_deref(), &images));
                 let out = run(cmd, &cwd, Some(prompt), timeout, cancelled)?;
                 parse_codex(&out)
             }
