@@ -1001,6 +1001,16 @@ pub fn test_connection(s: &LlmSettings) -> Result<()> {
     } else {
         serde_json::Value::String("只回复两个字符：ok".into())
     };
+    if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
+        let runner = crate::cli_provider::CliRunner::locate(kind)?;
+        let body = chat_body(&s.model, "", user, 512);
+        let text = runner.complete(&s.model, &body, None, Some(Duration::from_secs(120)), &|| false)?;
+        println!("{}: {}", runner.binary().display(), text.trim());
+        if s.vision {
+            println!("已测试图片输入。 / Image input tested.");
+        }
+        return Ok(());
+    }
     let body = crate::provider::test_body(s, user);
     let fail_hint = if s.vision {
         "连接失败。请确认服务地址、密钥及模型，并检查图片输入支持。 / Connection failed. Check the URL, API key, model, and image input support."
@@ -1049,6 +1059,7 @@ pub fn test_connection(s: &LlmSettings) -> Result<()> {
 /// 退格/删除等标准编辑键——裸 read_line 无法处理方向键转义序列（issue #3）。
 pub fn setup_interactive(
     mut cfg: crate::settings::ConfigFile,
+    provider: Option<LlmProvider>,
     base_url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
@@ -1062,6 +1073,29 @@ pub fn setup_interactive(
             v.trim().to_string()
         }
     };
+    // 未指定时交互终端里选择；脚本调用保持原行为（OpenAI 兼容端点）
+    let provider = match provider {
+        Some(p) => p,
+        None if interactive => {
+            let choices = [
+                (LlmProvider::OpenAiCompatible, "OpenAI 兼容服务（API key） / OpenAI-compatible service (API key)"),
+                (LlmProvider::ClaudeCode, "Claude Code（本机 claude，Claude 订阅） / Claude Code (local claude, Claude subscription)"),
+                (LlmProvider::CodexCli, "Codex CLI（本机 codex，ChatGPT 订阅） / Codex CLI (local codex, ChatGPT subscription)"),
+            ];
+            let current = choices.iter().position(|(p, _)| *p == cfg.llm.provider).unwrap_or(0);
+            let picked = dialoguer::Select::new()
+                .with_prompt("服务类型 / Provider")
+                .items(choices.map(|(_, label)| label))
+                .default(current)
+                .interact_opt()?
+                .ok_or_else(|| anyhow::anyhow!("已取消设置，未保存配置。 / Setup cancelled; no configuration saved."))?;
+            choices[picked].0
+        }
+        None => LlmProvider::OpenAiCompatible,
+    };
+    if crate::cli_provider::CliKind::of(provider).is_some() {
+        return setup_cli_provider(cfg, provider, model, disable_hint, interactive);
+    }
     if let Some(v) = base_url {
         cfg.llm.base_url = v.trim().to_string();
     } else if interactive {
@@ -1127,6 +1161,47 @@ pub fn setup_interactive(
     Ok(cfg)
 }
 
+/// CLI Provider：不需要服务地址和密钥，只定模型（默认 sonnet / gpt-5.5）。
+fn setup_cli_provider(
+    mut cfg: crate::settings::ConfigFile,
+    provider: LlmProvider,
+    model: Option<String>,
+    disable_hint: bool,
+    interactive: bool,
+) -> Result<crate::settings::ConfigFile> {
+    let default_model = match provider {
+        LlmProvider::CodexCli => "gpt-5.5",
+        _ => "sonnet",
+    };
+    let keep = cfg.llm.provider == provider && !cfg.llm.model.trim().is_empty();
+    let current = if keep { cfg.llm.model.clone() } else { default_model.to_string() };
+    cfg.llm.model = match model {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ if interactive => {
+            let v: String = dialoguer::Input::new()
+                .with_prompt("模型名 / Model name")
+                .with_initial_text(&current)
+                .allow_empty(true)
+                .interact_text()?;
+            if v.trim().is_empty() { current } else { v.trim().to_string() }
+        }
+        _ => current,
+    };
+    if interactive {
+        cfg.llm.vision = dialoguer::Select::new()
+            .with_prompt("润色时附上幻灯片截图？ / Attach slide images when polishing?")
+            .items(["仅发送文字 / Send text only", "发送文字和截图 / Send text and slide images"])
+            .default(if cfg.llm.vision { 1 } else { 0 })
+            .interact_opt()?
+            .ok_or_else(|| anyhow::anyhow!("已取消设置，未保存配置。 / Setup cancelled; no configuration saved."))? == 1;
+    }
+    cfg.llm.provider = provider;
+    validate(&cfg.llm)?;
+    cfg.llm.disable_hint |= disable_hint;
+    cfg.llm.enabled = true;
+    Ok(cfg)
+}
+
 pub fn print_status(cfg: &crate::settings::ConfigFile) {
     let s = &cfg.llm;
     let state = |enabled| {
@@ -1167,7 +1242,13 @@ pub fn print_status(cfg: &crate::settings::ConfigFile) {
         state(s.vision)
     );
     println!("  自动总结 / Automatic summary: {}", state(s.summarize));
-    println!("  并发请求 / Concurrent requests: {}", s.concurrency);
+    if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
+        match crate::cli_provider::CliRunner::locate(kind) {
+            Ok(runner) => println!("  CLI: {}", runner.binary().display()),
+            Err(e) => println!("  CLI: {e}"),
+        }
+    }
+    println!("  并发请求 / Concurrent requests: {}", effective_concurrency(s));
     println!("  使用提示 / Usage hint: {}", state(!s.disable_hint));
     if !s.enabled {
         println!("开启润色 / Enable transcript polish: course2md llm setup");

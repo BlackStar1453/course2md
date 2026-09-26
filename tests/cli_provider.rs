@@ -314,3 +314,14 @@ fn claude_code_uses_structured_output_when_a_schema_is_given() {
     let at = args.iter().position(|a| a == "--json-schema").expect("--json-schema passed");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&args[at + 1]).unwrap(), schema);
 }
+
+#[test]
+fn setup_for_a_cli_provider_needs_no_address_or_key_and_picks_a_default_model() {
+    let cfg = course2md::llm::setup_interactive(Default::default(), Some(LlmProvider::ClaudeCode), None, None, None, false).unwrap();
+    assert_eq!(cfg.llm.provider, LlmProvider::ClaudeCode);
+    assert_eq!(cfg.llm.model, "sonnet");
+    assert!(cfg.llm.enabled && cfg.llm.base_url.is_empty() && cfg.llm.api_key.is_empty());
+
+    let cfg = course2md::llm::setup_interactive(Default::default(), Some(LlmProvider::CodexCli), None, None, Some("gpt-5.4".into()), false).unwrap();
+    assert_eq!(cfg.llm.model, "gpt-5.4");
+}

@@ -193,6 +193,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             init_logging(0, false, false);
             match cmd {
                 LlmCmd::Setup {
+                    provider,
                     base_url,
                     api_key,
                     model,
@@ -200,6 +201,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 } => {
                     let cfg = llm::setup_interactive(
                         settings::load()?,
+                        provider,
                         base_url,
                         api_key,
                         model,
