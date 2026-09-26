@@ -162,6 +162,9 @@ fn claude_args(model: &str, system: &str) -> Vec<String> {
         "--strict-mcp-config",
         "--no-session-persistence",
         "--disable-slash-commands",
+        // 只读工作目录（空临时目录）的项目配置：不触发用户全局 hooks / 插件
+        "--setting-sources",
+        "project",
     ]
     .iter()
     .map(|s| s.to_string())

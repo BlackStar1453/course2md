@@ -49,7 +49,7 @@ fn claude_code_returns_the_final_result_text() {
 
     assert_eq!(text, r#"{"segments":[{"id":"0","text":"fixed"}]}"#);
     let args = argv(dir.path());
-    for expected in ["-p", "--verbose", "--strict-mcp-config", "--input-format", "--output-format", "stream-json", "--max-turns", "1", "--tools", "--model", "sonnet", "--system-prompt", "You proofread."] {
+    for expected in ["-p", "--verbose", "--strict-mcp-config", "--input-format", "--output-format", "stream-json", "--max-turns", "1", "--tools", "--model", "sonnet", "--system-prompt", "You proofread.", "--setting-sources", "project", "--no-session-persistence"] {
         assert!(args.iter().any(|a| a == expected), "missing {expected} in {args:?}");
     }
     let stdin = std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap();
