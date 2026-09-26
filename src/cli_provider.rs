@@ -4,7 +4,7 @@
 //! 文本；调用方把文本包成 chat/completions 响应，下游重试、校验、请求记录保持不变。
 //! 进程超时或取消时结束子进程；启动失败标记为「请求未发出」，不会被当作结果不确定。
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -40,6 +40,14 @@ impl CliKind {
         match self {
             Self::ClaudeCode => "claude",
             Self::CodexCli => "codex",
+        }
+    }
+
+    /// 默认模型（`llm setup` 未指定时）。
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "sonnet",
+            Self::CodexCli => "gpt-5.5",
         }
     }
 
@@ -126,10 +134,19 @@ impl CliRunner {
     pub fn locate(kind: CliKind) -> Result<Self, CliError> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let found = std::env::var_os(kind.env_override())
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .or_else(|| find_binary(kind.program(), &path, home.as_deref()));
+        // 手动指定了就只用它：指错了要让用户知道，不能悄悄换成别处的程序
+        if let Some(explicit) = std::env::var_os(kind.env_override()).map(PathBuf::from) {
+            return if is_executable(&explicit) {
+                Ok(Self::new(kind, explicit))
+            } else {
+                Err(not_started(format!(
+                    "{var} 指向的 {path} 不是可执行文件 / {var} points at {path}, which is not an executable",
+                    var = kind.env_override(),
+                    path = explicit.display(),
+                )))
+            };
+        }
+        let found = find_binary(kind.program(), &path, home.as_deref());
         found.map(|binary| Self::new(kind, binary)).ok_or_else(|| not_started(format!(
                 "找不到 {program}，请先安装并登录，或用 {var} 指定路径 / {program} not found; install and sign in first, or set {var}",
                 program = kind.program(),
@@ -394,7 +411,7 @@ struct Output {
 
 impl Output {
     fn describe_exit(&self) -> String {
-        let code = self.code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+        let code = self.code.map_or_else(|| "信号 / signal".to_string(), |c| c.to_string());
         let tail = excerpt(self.stderr.trim());
         if tail.is_empty() {
             format!(" (exit {code})")
@@ -497,16 +514,12 @@ fn run(
 
 fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(pipe) = pipe {
-            let mut reader = BufReader::new(pipe);
-            let mut line = String::new();
-            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                text.push_str(&line);
-                line.clear();
-            }
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
         }
-        text
+        // 非 UTF-8 字节替换掉即可，不能因此丢掉后面的输出
+        String::from_utf8_lossy(&bytes).into_owned()
     })
 }
 

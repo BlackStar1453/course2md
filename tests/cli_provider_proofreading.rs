@@ -99,3 +99,12 @@ fn a_failed_batch_does_not_stop_the_other_batches() {
     assert_eq!(sections[2].speech[0].text, "fixed");
     assert!(report.note.as_deref().unwrap_or_default().contains("error_max_turns"), "{report:?}");
 }
+
+#[test]
+fn an_invalid_program_override_is_reported_not_ignored() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // SAFETY: environment changes are serialised by ENV_LOCK.
+    unsafe { std::env::set_var("COURSE2MD_CLAUDE_BIN", "/nonexistent/claude") };
+    let err = course2md::cli_provider::CliRunner::locate(course2md::cli_provider::CliKind::ClaudeCode).unwrap_err();
+    assert!(err.message.contains("/nonexistent/claude") && err.message.contains("COURSE2MD_CLAUDE_BIN"), "{}", err.message);
+}

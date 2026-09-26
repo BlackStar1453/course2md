@@ -134,6 +134,8 @@ const CLI_DEFAULT_CONCURRENCY: usize = 2;
 const CLI_MAX_CONCURRENCY: usize = 4;
 
 /// 实际并发数。CLI Provider 未调整过（仍是 HTTP 默认值）时用 2，最多 4。
+/// 配置里只存一个数字，无法区分「没设置」与「明确设为 8」；后者对 CLI 也按 2 处理
+///（在上限 4 以内，不会超额），换来配置格式与上游保持兼容。
 pub fn effective_concurrency(s: &LlmSettings) -> usize {
     if crate::cli_provider::CliKind::of(s.provider).is_some() {
         if s.concurrency == DEFAULT_CONCURRENCY {
@@ -1015,7 +1017,7 @@ pub fn test_connection(s: &LlmSettings) -> Result<()> {
     if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
         let runner = crate::cli_provider::CliRunner::locate(kind)?;
         let body = chat_body(&s.model, "", user, 512);
-        let text = runner.complete(&s.model, &body, None, Some(Duration::from_secs(120)), &|| false)?;
+        let text = runner.complete(&s.model, &body, None, None, &|| false)?;
         println!("{}: {}", runner.binary().display(), text.trim());
         if s.vision {
             println!("已测试图片输入。 / Image input tested.");
@@ -1180,10 +1182,8 @@ fn setup_cli_provider(
     disable_hint: bool,
     interactive: bool,
 ) -> Result<crate::settings::ConfigFile> {
-    let default_model = match provider {
-        LlmProvider::CodexCli => "gpt-5.5",
-        _ => "sonnet",
-    };
+    let default_model = crate::cli_provider::CliKind::of(provider)
+        .map_or("", crate::cli_provider::CliKind::default_model);
     let keep = cfg.llm.provider == provider && !cfg.llm.model.trim().is_empty();
     let current = if keep { cfg.llm.model.clone() } else { default_model.to_string() };
     cfg.llm.model = match model {
@@ -1255,8 +1255,8 @@ pub fn print_status(cfg: &crate::settings::ConfigFile) {
     println!("  自动总结 / Automatic summary: {}", state(s.summarize));
     if let Some(kind) = crate::cli_provider::CliKind::of(s.provider) {
         match crate::cli_provider::CliRunner::locate(kind) {
-            Ok(runner) => println!("  CLI: {}", runner.binary().display()),
-            Err(e) => println!("  CLI: {e}"),
+            Ok(runner) => println!("  CLI 程序 / CLI program: {}", runner.binary().display()),
+            Err(e) => println!("  CLI 程序 / CLI program: {e}"),
         }
     }
     println!("  并发请求 / Concurrent requests: {}", effective_concurrency(s));
