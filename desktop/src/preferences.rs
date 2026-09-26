@@ -336,6 +336,16 @@ impl ServiceProtocol {
         self.cli_kind().map(course2md::cli_provider::CliKind::default_model)
     }
 
+    /// 本机 CLI 没有模型目录：模型框里说明可填写什么，替代「获取候选」。
+    pub fn model_hint(self) -> Option<String> {
+        let kind = self.cli_kind()?;
+        Some(format!(
+            "本机 {} 不提供模型列表；可填写它接受的任意模型名，默认 {}。",
+            kind.program(),
+            kind.default_model()
+        ))
+    }
+
     /// 由本机 CLI 承载的服务类型（没有服务地址，改为检测本机程序）。
     pub fn cli_kind(self) -> Option<course2md::cli_provider::CliKind> {
         course2md::cli_provider::CliKind::of(self.llm_provider())

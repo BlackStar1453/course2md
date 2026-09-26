@@ -579,6 +579,7 @@ impl Desktop {
         service.running = None;
         service.draft = draft.clone();
         service.local_cli = preferences::detect_local_cli(draft.protocol);
+        service.models.set_catalog_hint(draft.protocol.model_hint());
         service.original = original;
         service.pending_version = None;
         service.models.invalidate();
@@ -1546,6 +1547,7 @@ impl Desktop {
                 });
             }
             service.local_cli = preferences::detect_local_cli(protocol);
+            service.models.set_catalog_hint(protocol.model_hint());
             if protocol.keyless() {
                 service.draft.authentication = Authentication::None;
                 service.inputs[&InputField::Key].update(cx, |input, cx| {
@@ -1643,12 +1645,6 @@ impl Desktop {
             == preferences::ServiceProtocol::CodexResponses
         {
             self.codex_refresh_models(crate::codex_ui::CodexSurface::Onboarding, cx);
-            return;
-        }
-        // 本机 CLI 没有模型目录接口：给出推荐模型，其余模型 ID 由用户直接输入
-        if let Some(model) = self.onboarding.service(purpose).draft.protocol.default_model() {
-            self.onboarding.service_mut(purpose).models.prime(vec![model.to_string()]);
-            cx.notify();
             return;
         }
         let service = self.onboarding.service(purpose);
@@ -1882,12 +1878,18 @@ impl Desktop {
         if service.draft.protocol.has_address() {
             body = body.child(self.setup_input_row(purpose, InputField::Address, "服务地址", cx));
         } else if let Some(detected) = &service.local_cli {
-            body = body.child(help(
-                "setup-local-cli",
-                preferences::local_cli_note(service.draft.protocol, detected),
-            ));
+            let note = preferences::local_cli_note(service.draft.protocol, detected);
+            body = body.child(match detected {
+                Ok(_) => help("setup-local-cli", note),
+                Err(_) => theme::supporting_warning("setup-local-cli", note),
+            });
         } else if codex {
-            body = body.child(help("setup-codex-endpoint", crate::codex_ui::ENDPOINT_NOTE));
+            body = body
+                .child(help("setup-codex-endpoint", crate::codex_ui::ENDPOINT_NOTE))
+                .child(theme::supporting_warning(
+                    "setup-codex-sign-in-risk",
+                    crate::codex_ui::SIGN_IN_RISK,
+                ));
         }
         if !service.draft.protocol.keyless() {
             body = body.child(

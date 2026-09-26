@@ -152,6 +152,9 @@ pub enum Status {
 pub struct State {
     active: Option<Ticket>,
     status: Status,
+    /// 服务类型没有模型目录（本机 CLI）：不提供获取按钮，改为说明可填写的模型。
+    /// 属于服务类型而非某次获取结果，`invalidate` 不清除。
+    catalog_hint: Option<String>,
 }
 
 impl State {
@@ -166,6 +169,9 @@ impl State {
             Status::Ready(models) => models,
             _ => &[],
         }
+    }
+    pub fn set_catalog_hint(&mut self, hint: Option<String>) {
+        self.catalog_hint = hint;
     }
     pub fn invalidate(&mut self) {
         if let Some(active) = self.active.take() {
@@ -430,7 +436,10 @@ pub fn model_field_with_error(
     let selected = input.read(cx).value().to_string();
     let field = input.clone();
     let status = match state.status() {
-        Status::Idle => "可手动填写模型 ID，或点击右侧获取候选。".into(),
+        Status::Idle => state
+            .catalog_hint
+            .clone()
+            .unwrap_or_else(|| "可手动填写模型 ID，或点击右侧获取候选。".into()),
         Status::Loading => "正在获取候选模型，仍可手动填写。".into(),
         Status::Ready(models) if models.is_empty() => "服务未返回模型，可手动填写模型 ID。".into(),
         Status::Ready(models) => {
@@ -442,7 +451,7 @@ pub fn model_field_with_error(
         .flex_shrink_0()
         .items_center()
         .gap_1()
-        .child(
+        .when(state.catalog_hint.is_none(), |row| row.child(
             input_action(SharedString::from(format!("{id}-fetch")))
                 .icon(icons::refresh())
                 .tooltip(if matches!(state.status(), Status::Ready(_)) {
@@ -458,7 +467,7 @@ pub fn model_field_with_error(
                 .loading(state.loading())
                 .disabled(disabled || state.loading())
                 .on_click(on_fetch),
-        )
+        ))
         .when(!models.is_empty(), |row| {
             row.child(
                 input_action(SharedString::from(format!("{id}-choose")))
@@ -678,6 +687,19 @@ mod tests {
         state.invalidate();
         assert!(state.models().is_empty());
         assert!(matches!(state.status(), Status::Idle));
+    }
+
+    #[test]
+    fn a_catalog_hint_belongs_to_the_service_kind_and_survives_invalidation() {
+        use crate::preferences::ServiceProtocol;
+        let mut state = State::default();
+        state.set_catalog_hint(ServiceProtocol::CodexCli.model_hint());
+        state.invalidate();
+        let hint = state.catalog_hint.clone().unwrap();
+        assert!(hint.contains("codex") && hint.contains("gpt-5.5"), "{hint}");
+        // 有模型目录的服务类型不带说明，照常提供获取按钮
+        state.set_catalog_hint(ServiceProtocol::AiChat.model_hint());
+        assert!(state.catalog_hint.is_none());
     }
 
     struct FakeTransport {

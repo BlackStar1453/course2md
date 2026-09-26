@@ -2425,7 +2425,11 @@ impl Desktop {
         let draft_protocol = draft.protocol;
         self.settings_ui.editor = Some(ServiceEditor {
             draft,
-            models: Default::default(),
+            models: {
+                let mut models = crate::model_discovery::State::default();
+                models.set_catalog_hint(draft_protocol.model_hint());
+                models
+            },
             target,
             repair_task,
             scroll: ScrollHandle::new(),
@@ -2622,19 +2626,21 @@ impl Desktop {
         if protocol.has_address() {
             view = view.child(self.setting_field(EditField::Address, "服务地址", cx));
         } else if let Some(detected) = self.settings_ui.editor.as_ref().and_then(|e| e.local_cli.as_ref()) {
-            view = view.child(
-                theme::supporting_info("service-local-cli", preferences::local_cli_note(protocol, detected))
-                    .w_full()
-                    .min_w_0()
-                    .whitespace_normal(),
-            );
+            let note = preferences::local_cli_note(protocol, detected);
+            view = view.child(match detected {
+                Ok(_) => theme::supporting_info("service-local-cli", note),
+                Err(_) => theme::supporting_warning("service-local-cli", note),
+            });
         } else {
-            view = view.child(
-                theme::supporting_info("service-codex-endpoint", crate::codex_ui::ENDPOINT_NOTE)
-                    .w_full()
-                    .min_w_0()
-                    .whitespace_normal(),
-            );
+            view = view
+                .child(theme::supporting_info(
+                    "service-codex-endpoint",
+                    crate::codex_ui::ENDPOINT_NOTE,
+                ))
+                .child(theme::supporting_warning(
+                    "service-codex-sign-in-risk",
+                    crate::codex_ui::SIGN_IN_RISK,
+                ));
         }
         let address = self.setting_value(EditField::Address, cx);
         if protocol.has_address()
@@ -3194,6 +3200,7 @@ impl Desktop {
                 });
             }
             editor.local_cli = preferences::detect_local_cli(candidate);
+            editor.models.set_catalog_hint(candidate.model_hint());
             editor.models.invalidate();
             editor.errors.clear();
             editor.evidence = None;
@@ -3239,14 +3246,6 @@ impl Desktop {
             .is_some_and(|editor| editor.draft.protocol == ServiceProtocol::CodexResponses)
         {
             self.codex_refresh_models(crate::codex_ui::CodexSurface::Editor, cx);
-            return;
-        }
-        // 本机 CLI 没有模型目录接口：给出推荐模型，其余模型 ID 由用户直接输入
-        if let Some(editor) = &mut self.settings_ui.editor
-            && let Some(model) = editor.draft.protocol.default_model()
-        {
-            editor.models.prime(vec![model.to_string()]);
-            cx.notify();
             return;
         }
         let Some(draft) = self.live_service_model_draft(cx) else {
