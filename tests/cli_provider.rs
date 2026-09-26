@@ -297,3 +297,20 @@ fn codex_cli_gets_the_screenshot_as_a_file_that_is_removed_afterwards() {
     assert!(!Path::new(image_arg.trim_start_matches("--image=")).exists(), "temp screenshot left behind");
     assert_eq!(args.last().map(String::as_str), Some("-"));
 }
+
+#[test]
+fn claude_code_uses_structured_output_when_a_schema_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    // `result` holds prose; the schema-validated answer is in `structured_output`.
+    let out = r#"{"type":"result","subtype":"success","is_error":false,"result":"Here you go","structured_output":{"segments":[{"id":0,"text":"he said \"hello\""}]}}"#;
+    let runner = CliRunner::new(CliKind::ClaudeCode, fake_cli(dir.path(), out, 0));
+    let schema = serde_json::json!({"type": "object", "required": ["segments"]});
+
+    let text = runner.complete("sonnet", &text_body(), Some(&schema), None, &|| false).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["segments"][0]["text"], "he said \"hello\"");
+    let args = argv(dir.path());
+    let at = args.iter().position(|a| a == "--json-schema").expect("--json-schema passed");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&args[at + 1]).unwrap(), schema);
+}

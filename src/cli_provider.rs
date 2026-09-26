@@ -144,7 +144,7 @@ impl CliRunner {
         match self.kind {
             CliKind::ClaudeCode => {
                 let mut cmd = Command::new(&self.binary);
-                cmd.args(claude_args(model, system));
+                cmd.args(claude_args(model, system, output_schema));
                 let stdin = claude_stdin(user);
                 let out = run(cmd, Some(stdin), timeout.unwrap_or(DEFAULT_TIMEOUT), cancelled)?;
                 parse_claude(&out)
@@ -178,7 +178,7 @@ impl CliRunner {
     }
 }
 
-fn claude_args(model: &str, system: &str) -> Vec<String> {
+fn claude_args(model: &str, system: &str, schema: Option<&Value>) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--verbose",
@@ -205,6 +205,10 @@ fn claude_args(model: &str, system: &str) -> Vec<String> {
     }
     if !system.is_empty() {
         args.extend(["--system-prompt".into(), system.into()]);
+    }
+    if let Some(schema) = schema {
+        // 内置 StructuredOutput：单轮、无工具时同样可用，杜绝未转义引号等无效 JSON
+        args.extend(["--json-schema".into(), schema.to_string()]);
     }
     args
 }
@@ -340,6 +344,11 @@ fn parse_claude(out: &Output) -> Result<String, CliError> {
                 }
             }
             Some("result") => {
+                if event["is_error"].as_bool() != Some(true)
+                    && let Some(structured) = event.get("structured_output").filter(|v| !v.is_null())
+                {
+                    return Ok(structured.to_string());
+                }
                 let text = event["result"].as_str().unwrap_or_default();
                 if event["is_error"].as_bool() == Some(true) || event["subtype"].as_str() != Some("success") {
                     return Err(failed(format!(
