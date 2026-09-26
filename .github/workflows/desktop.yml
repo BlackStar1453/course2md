@@ -38,6 +38,12 @@ jobs:
           else
             python desktop/scripts/sources.py
           fi
+      # Fork-only: .deps is rewritten on every run, and Cargo decides freshness of path
+      # dependencies by mtime; pin their mtimes so cached outputs stay fresh. A change
+      # of revision or patch changes the cache key below, so stale outputs are never reused.
+      - name: Pin source dependency mtimes for the compiler cache
+        if: runner.os == 'macOS'
+        run: find desktop/.deps -exec touch -h -t 200001010000 {} +
       # Fork-only: reuse compiled dependencies between pushes (cold build ~21 min).
       - name: Restore macOS compiler cache
         if: runner.os == 'macOS'
@@ -50,9 +56,9 @@ jobs:
             desktop/target
             !target/debug/incremental
             !desktop/target/debug/incremental
-          key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock') }}-${{ github.run_id }}
+          key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock', 'desktop/sources.lock.json', 'desktop/patches/**') }}-${{ github.run_id }}
           restore-keys: |
-            desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock') }}-
+            desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock', 'desktop/sources.lock.json', 'desktop/patches/**') }}-
             desktop-macos-
       - name: Check and test desktop
         run: cargo test --manifest-path desktop/Cargo.toml
@@ -76,7 +82,7 @@ jobs:
             desktop/target
             !target/debug/incremental
             !desktop/target/debug/incremental
-          key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock') }}-${{ github.run_id }}
+          key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock', 'desktop/sources.lock.json', 'desktop/patches/**') }}-${{ github.run_id }}
       - name: Free completed compiler caches before creating the disk image
         if: github.ref_type != 'tag' && runner.os == 'macOS'
         run: |
