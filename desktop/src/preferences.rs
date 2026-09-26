@@ -346,7 +346,8 @@ impl ServiceProtocol {
         match self {
             Self::AiChat => "OpenAI 兼容服务",
             Self::OllamaChat => "Ollama 本地服务",
-            Self::CodexResponses => "OpenAI Codex 订阅",
+            // 与其账号面板标题一致，也让五个 AI 类型在常规宽度下一行放下
+            Self::CodexResponses => "Codex 账号",
             Self::ClaudeCodeCli => "Claude Code",
             Self::CodexCli => "Codex CLI",
             other => other.label(),

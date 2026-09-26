@@ -2592,6 +2592,7 @@ impl Desktop {
                     ))
                     .child(
                         self.setting_choices("service-protocol", "服务接口类型")
+                            .stack_if_narrower_than(crate::views::settings_content_width(window))
                             .options(
                                 ServiceProtocol::ALL
                                 .into_iter()

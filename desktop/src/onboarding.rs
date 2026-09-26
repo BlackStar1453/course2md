@@ -455,6 +455,14 @@ fn evidence_covers(
     })
 }
 
+/// 引导面板宽度（随字号放大，窗口窄时收窄）；面板内容区另有左右各 32px 内边距。
+fn setup_panel_width(window: &Window) -> f32 {
+    let scale = f32::from(window.rem_size()) / 14.;
+    (760. * scale.min(1.5))
+        .min(f32::from(window.viewport_size().width) - 48.)
+        .max(280.)
+}
+
 fn help(id: impl Into<ElementId>, value: impl Into<SharedString>) -> Div {
     // 与设置页同一辅助信息处理：共享 ⓘ 图标 + 常规字重（review4#2）
     theme::supporting_info(id, value)
@@ -1043,9 +1051,7 @@ impl Desktop {
             Step::Model => self.setup_model_content(window, cx),
         };
         let scale = f32::from(window.rem_size()) / 14.;
-        let width = (760. * scale.min(1.5))
-            .min(f32::from(window.viewport_size().width) - 48.)
-            .max(280.);
+        let width = setup_panel_width(window);
         let available_height =
             (f32::from(window.viewport_size().height) - (40. * scale + 16.) - 48.).max(160.);
         let compact = available_height < 540. * scale;
@@ -1848,6 +1854,7 @@ impl Desktop {
                         icons::cloud(),
                         SingleChoiceGroup::new("setup-ai-kind", "AI 服务类型")
                             .full_width()
+                            .stack_if_narrower_than(setup_panel_width(window) - 64.)
                             .options(
                                 preferences::ServiceProtocol::ALL
                                 .into_iter()
