@@ -2,6 +2,13 @@ name: native desktop
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        # Fork-only: an unsigned release build of the current ref (upstream's release.yml
+        # needs signing material and publishes a GitHub Release plus Homebrew/AUR).
+        description: 'Build release packages (unsigned) instead of development packages'
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -32,8 +39,10 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       - name: Prepare source dependencies
         shell: bash
+        env:
+          RELEASE: ${{ inputs.release }}
         run: |
-          if [[ "$GITHUB_REF_TYPE" == tag || "$GITHUB_EVENT_NAME" == pull_request ]]; then
+          if [[ "$GITHUB_REF_TYPE" == tag || "$GITHUB_EVENT_NAME" == pull_request || "$RELEASE" == true ]]; then
             python desktop/scripts/sources.py --locked
           else
             python desktop/scripts/sources.py
@@ -65,16 +74,16 @@ jobs:
       - name: Check and test desktop
         run: cargo test --manifest-path desktop/Cargo.toml
       - name: Build development packages
-        if: github.ref_type != 'tag' && runner.os != 'macOS'
+        if: github.ref_type != 'tag' && inputs.release != true && runner.os != 'macOS'
         run: python desktop/scripts/package.py --debug
       - name: Build macOS development binaries
-        if: github.ref_type != 'tag' && runner.os == 'macOS'
+        if: github.ref_type != 'tag' && inputs.release != true && runner.os == 'macOS'
         run: |
           cargo build
           cargo build --manifest-path desktop/Cargo.toml
       # Fork-only: save before the disk-image step deletes target/debug/deps.
       - name: Save macOS compiler cache
-        if: github.ref_type != 'tag' && runner.os == 'macOS'
+        if: github.ref_type != 'tag' && inputs.release != true && runner.os == 'macOS'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -87,16 +96,30 @@ jobs:
             !desktop/target/debug/incremental
           key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock', 'desktop/sources.lock.json', 'desktop/patches/**', 'native/apple-asr/Package.resolved') }}-${{ github.run_id }}
       - name: Free completed compiler caches before creating the disk image
-        if: github.ref_type != 'tag' && runner.os == 'macOS'
+        if: github.ref_type != 'tag' && inputs.release != true && runner.os == 'macOS'
         run: |
           rm -rf target/debug/deps target/debug/incremental desktop/target/debug/deps desktop/target/debug/incremental
           df -h .
       - name: Package macOS development binaries
-        if: github.ref_type != 'tag' && runner.os == 'macOS'
+        if: github.ref_type != 'tag' && inputs.release != true && runner.os == 'macOS'
         run: python desktop/scripts/package.py --debug --no-build
       - name: Build release with tested source revisions
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.release == true
         run: python desktop/scripts/package.py
+      # Fork-only: keep release-profile outputs for the next release build.
+      - name: Save macOS compiler cache (release)
+        if: inputs.release == true && runner.os == 'macOS'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/target
+            native/apple-asr/.build
+            !target/debug/incremental
+            !desktop/target/debug/incremental
+          key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock', 'desktop/sources.lock.json', 'desktop/patches/**', 'native/apple-asr/Package.resolved') }}-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         with:
           name: course2md-desktop-${{ runner.os }}
