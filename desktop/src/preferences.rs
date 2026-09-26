@@ -396,6 +396,10 @@ pub const OLLAMA_DEFAULT_ADDRESS: &str = "http://localhost:11434";
 
 /// 地址在其协议下归一化后的展示主机名——空服务名称的自动取值来源。
 pub fn service_host(address: &str, protocol: ServiceProtocol) -> Option<String> {
+    // 本机 CLI 没有主机名：用可读的类型名作为自动名称
+    if protocol.cli_kind().is_some() {
+        return Some(protocol.ai_kind_label().to_owned());
+    }
     let endpoint = normalize_endpoint(address, protocol).ok()?;
     url::Url::parse(&endpoint)
         .ok()?
@@ -2223,7 +2227,8 @@ mod tests {
             assert_eq!(normalize_endpoint("https://leftover.example/v1", protocol).unwrap(), fixed);
             assert!(protocol.keyless());
             assert_eq!(protocol.purpose(), ServicePurpose::Ai);
-            assert!(service_host("", protocol).is_some());
+            // 自动生成的服务名称用可读的类型名，而不是内部标识
+            assert_eq!(service_host("", protocol).as_deref(), Some(protocol.ai_kind_label()));
         }
     }
 
