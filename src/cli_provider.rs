@@ -76,11 +76,15 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
-/// CLI 调用失败。`not_started` = 进程没起来，请求内容确定没有发出。
+/// CLI 调用失败。
+/// - `not_started`：进程没起来，请求内容确定没有发出；
+/// - `finished`：进程自己退出并报告了失败，结果是确定的（不是「不知道模型有没有处理」）。
+///   超时、取消时由我们结束进程，两者都为 false。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliError {
     pub message: String,
     pub not_started: bool,
+    pub finished: bool,
 }
 
 impl std::fmt::Display for CliError {
@@ -91,8 +95,19 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// 进程已退出、明确失败。
 fn failed(message: impl Into<String>) -> CliError {
-    CliError { message: message.into(), not_started: false }
+    CliError { message: message.into(), not_started: false, finished: true }
+}
+
+/// 进程被我们中止或状态未知：模型可能已处理，结果不确定。
+fn interrupted(message: impl Into<String>) -> CliError {
+    CliError { message: message.into(), not_started: false, finished: false }
+}
+
+/// 进程没有启动：请求确定没有发出。
+fn not_started(message: impl Into<String>) -> CliError {
+    CliError { message: message.into(), not_started: true, finished: false }
 }
 
 /// 一个已定位好的 CLI 程序。
@@ -115,14 +130,11 @@ impl CliRunner {
             .map(PathBuf::from)
             .filter(|p| p.is_file())
             .or_else(|| find_binary(kind.program(), &path, home.as_deref()));
-        found.map(|binary| Self::new(kind, binary)).ok_or_else(|| CliError {
-            message: format!(
+        found.map(|binary| Self::new(kind, binary)).ok_or_else(|| not_started(format!(
                 "找不到 {program}，请先安装并登录，或用 {var} 指定路径 / {program} not found; install and sign in first, or set {var}",
                 program = kind.program(),
                 var = kind.env_override(),
-            ),
-            not_started: true,
-        })
+            )))
     }
 
     pub fn binary(&self) -> &std::path::Path {
@@ -154,15 +166,12 @@ impl CliRunner {
                 let scratch = tempfile::Builder::new()
                     .prefix("course2md-codex-")
                     .tempdir()
-                    .map_err(|e| CliError { message: format!("无法创建临时目录 / Could not create a temp dir: {e}"), not_started: true })?;
+                    .map_err(|e| not_started(format!("无法创建临时目录 / Could not create a temp dir: {e}")))?;
                 let (prompt, images) = codex_input(system, user, scratch.path())?;
                 let schema = match output_schema {
                     Some(schema) => {
                         let path = scratch.path().join("schema.json");
-                        std::fs::write(&path, schema.to_string()).map_err(|e| CliError {
-                            message: format!("无法写入输出结构 / Could not write the output schema: {e}"),
-                            not_started: true,
-                        })?;
+                        std::fs::write(&path, schema.to_string()).map_err(|e| not_started(format!("无法写入输出结构 / Could not write the output schema: {e}")))?;
                         Some(path)
                     }
                     None => None,
@@ -187,7 +196,8 @@ fn claude_args(model: &str, system: &str, schema: Option<&Value>) -> Vec<String>
         "--output-format",
         "stream-json",
         "--max-turns",
-        "1",
+        // StructuredOutput 本身占一轮（常见 2–3 轮）；无 schema 时一轮即答完。工具全关，多给的轮次无法做别的事
+        if schema.is_some() { "3" } else { "1" },
         "--tools",
         "",
         "--strict-mcp-config",
@@ -288,15 +298,9 @@ fn codex_input(system: &str, user: &Value, dir: &std::path::Path) -> Result<(Str
             let url = part["image_url"]["url"].as_str().unwrap_or_default();
             let (meta, data) = url.split_once(',').unwrap_or(("", url));
             let ext = if meta.contains("png") { "png" } else { "jpg" };
-            let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| CliError {
-                message: format!("截图数据无效 / Invalid screenshot data: {e}"),
-                not_started: true,
-            })?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| not_started(format!("截图数据无效 / Invalid screenshot data: {e}")))?;
             let path = dir.join(format!("image-{}.{ext}", images.len()));
-            std::fs::write(&path, bytes).map_err(|e| CliError {
-                message: format!("无法写入截图 / Could not write the screenshot: {e}"),
-                not_started: true,
-            })?;
+            std::fs::write(&path, bytes).map_err(|e| not_started(format!("无法写入截图 / Could not write the screenshot: {e}")))?;
             images.push(path);
         } else if let Some(text) = part["text"].as_str() {
             prompt.push_str(text);
@@ -351,8 +355,9 @@ fn parse_claude(out: &Output) -> Result<String, CliError> {
                 }
                 let text = event["result"].as_str().unwrap_or_default();
                 if event["is_error"].as_bool() == Some(true) || event["subtype"].as_str() != Some("success") {
+                    let subtype = event["subtype"].as_str().unwrap_or("error");
                     return Err(failed(format!(
-                        "Claude Code 返回错误 / Claude Code returned an error: {}",
+                        "Claude Code 返回错误 / Claude Code returned an error ({subtype}): {}",
                         excerpt(text)
                     )));
                 }
@@ -422,10 +427,9 @@ fn run(
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| CliError {
-        message: format!("无法启动 CLI / Could not start the CLI: {e}"),
-        not_started: true,
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| not_started(format!("无法启动 CLI / Could not start the CLI: {e}")))?;
     if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // 独立线程写入：大截图超过管道缓冲时，CLI 不读就会阻塞，不能挡住超时/取消检查。
         // 写完即关闭 stdin，CLI 才知道输入结束；子进程被结束后写入自然报错退出。
@@ -442,16 +446,16 @@ fn run(
             Ok(None) => {}
             Err(e) => {
                 kill(&mut child);
-                return Err(failed(format!("等待 CLI 失败 / Failed waiting for the CLI: {e}")));
+                return Err(interrupted(format!("等待 CLI 失败 / Failed waiting for the CLI: {e}")));
             }
         }
         if cancelled() {
             kill(&mut child);
-            return Err(failed("任务已取消，已结束 CLI / Task cancelled; CLI stopped"));
+            return Err(interrupted("任务已取消，已结束 CLI / Task cancelled; CLI stopped"));
         }
         if started.elapsed() >= timeout {
             kill(&mut child);
-            return Err(failed(format!(
+            return Err(interrupted(format!(
                 "CLI 超过 {} 秒未完成，已结束 / CLI did not finish within {} s; stopped",
                 timeout.as_secs(),
                 timeout.as_secs()

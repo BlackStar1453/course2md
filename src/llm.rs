@@ -871,13 +871,20 @@ fn request_cli_once(
         err: anyhow::Error::new(err),
     })?;
     crate::dispatch::json_request_described("llm", purpose, description, url, body, || {
-        let text = runner
-            .complete(&s.model, body, output_schema(purpose).as_ref(), None, &|| crate::dispatch::check_control().is_err())
-            .map_err(|e| crate::dispatch::NetworkFailure {
-                message: e.message,
-                definitely_unsent: e.not_started,
-            })?;
-        let wrapped = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": text}}]});
+        let wrapped = match runner.complete(&s.model, body, output_schema(purpose).as_ref(), None, &|| {
+            crate::dispatch::check_control().is_err()
+        }) {
+            Ok(text) => serde_json::json!({"choices": [{"message": {"role": "assistant", "content": text}}]}),
+            // CLI 已退出并报告失败：结果确定，记为该批失败（保留原文），不冻结其他请求
+            Err(e) if e.finished => serde_json::json!({"error": {"message": e.message, "source": "cli"}}),
+            // 没起来 = 未发出；被我们中止 = 结果不确定，交给请求记录按原规则处理
+            Err(e) => {
+                return Err(crate::dispatch::NetworkFailure {
+                    message: e.message,
+                    definitely_unsent: e.not_started,
+                });
+            }
+        };
         Ok(crate::dispatch::HttpResponse {
             status: 200,
             body: serde_json::to_vec(&wrapped).unwrap_or_default(),
@@ -915,6 +922,10 @@ fn output_schema(purpose: &str) -> Option<serde_json::Value> {
 /// 响应校验（HTTP 与 CLI Provider 共用）：有正文、摘要可解析、校对段落一一对应。
 fn validate_chat_response(value: &serde_json::Value, body: &serde_json::Value, purpose: &str) -> Result<()> {
     {
+        // 本机 CLI 的错误信息不含服务端回显的凭据，可以原样保留，便于排查
+        if value["error"]["source"] == "cli" {
+            anyhow::bail!("{}", value["error"]["message"].as_str().unwrap_or_default());
+        }
         anyhow::ensure!(value.get("error").is_none_or(serde_json::Value::is_null), "AI 服务返回错误内容 / AI service returned an error");
         let content = value["choices"][0]["message"]["content"].as_str().filter(|s| !s.trim().is_empty()).context("AI 服务响应缺少正文 / AI response is missing message.content")?;
         if purpose == "summary" { anyhow::ensure!(crate::summarize::parse_summary(content).is_some(), "服务返回的摘要结构无效 / Invalid summary structure"); }

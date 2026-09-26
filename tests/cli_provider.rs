@@ -311,6 +311,9 @@ fn claude_code_uses_structured_output_when_a_schema_is_given() {
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed["segments"][0]["text"], "he said \"hello\"");
     let args = argv(dir.path());
+    // StructuredOutput is a tool call on its own turn; one turn is not enough.
+    let turns = args.iter().position(|a| a == "--max-turns").unwrap();
+    assert_eq!(args[turns + 1], "3");
     let at = args.iter().position(|a| a == "--json-schema").expect("--json-schema passed");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&args[at + 1]).unwrap(), schema);
 }
@@ -324,4 +327,13 @@ fn setup_for_a_cli_provider_needs_no_address_or_key_and_picks_a_default_model() 
 
     let cfg = course2md::llm::setup_interactive(Default::default(), Some(LlmProvider::CodexCli), None, None, Some("gpt-5.4".into()), false).unwrap();
     assert_eq!(cfg.llm.model, "gpt-5.4");
+}
+
+#[test]
+fn a_failure_without_result_text_still_says_what_went_wrong() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#;
+    let runner = CliRunner::new(CliKind::ClaudeCode, fake_cli(dir.path(), out, 1));
+    let err = runner.complete("sonnet", &text_body(), None, None, &|| false).unwrap_err();
+    assert!(err.message.contains("error_max_turns"), "{}", err.message);
 }
