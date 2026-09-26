@@ -451,7 +451,9 @@ impl RenderOnce for SingleChoiceGroup {
             .min_w_0()
             .max_w_full()
             .p(px(inset))
-            .rounded_full()
+            // 竖排时整体 rounded_full 会把发丝边画成一个大椭圆；改为与胶囊选项同心的圆角
+            .when(!vertical, |group| group.rounded_full())
+            .when(vertical, |group| group.rounded(item_height / 2. + px(inset)))
             // 轨道用内嵌面色（与输入框同一 recessed 语义）：4.5% 混合在深色下与卡片底无法区分，
             // 导致「选中段跳出轨道」的错觉（system.md：角色映射失败应在共享层修正）。
             // 页面底色与 INSET 几乎相同，单靠填充在页面背景上轨道会消失（reader 页签、
