@@ -512,10 +512,9 @@ impl ServiceDraft {
             );
         }
         let endpoint = normalize_endpoint(&self.address, self.protocol)?;
-        let host = url::Url::parse(&endpoint)?
-            .host_str()
-            .unwrap_or_default()
-            .to_owned();
+        url::Url::parse(&endpoint)?;
+        // 与编辑时自动填入的名称同源（本机 CLI 用类型名而不是 cli:// 标识）
+        let host = service_host(&self.address, self.protocol).unwrap_or_default();
         // 无密钥协议（Ollama 本地、Codex 登录态）不持有任何凭据
         let authentication = if self.protocol.keyless() {
             Authentication::None
@@ -2229,6 +2228,12 @@ mod tests {
             assert_eq!(protocol.purpose(), ServicePurpose::Ai);
             // 自动生成的服务名称用可读的类型名，而不是内部标识
             assert_eq!(service_host("", protocol).as_deref(), Some(protocol.ai_kind_label()));
+            // 名称留空直接保存（首次启动引导走这条路）也用同一个可读名称
+            let mut draft = ServiceDraft::new(ServicePurpose::Ai);
+            draft.protocol = protocol;
+            draft.authentication = Authentication::None;
+            draft.model = "fixture-model".into();
+            assert_eq!(draft.configuration().unwrap().name, protocol.ai_kind_label());
         }
     }
 
