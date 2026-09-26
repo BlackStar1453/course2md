@@ -38,6 +38,8 @@ pub enum LlmProvider {
     Codex,
     /// 本机 Claude Code CLI（`claude -p`，走 Claude 订阅）
     ClaudeCode,
+    /// 本机 Codex CLI（`codex exec`，走 ChatGPT 订阅；登录态由 Codex CLI 自己管理）
+    CodexCli,
 }
 
 impl LlmProvider {
@@ -47,6 +49,7 @@ impl LlmProvider {
             Self::Ollama => "ollama",
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
+            Self::CodexCli => "codex-cli",
         }
     }
 }
@@ -869,7 +872,7 @@ fn request_cli_once(
     })?;
     crate::dispatch::json_request_described("llm", purpose, description, url, body, || {
         let text = runner
-            .complete(&s.model, body, None, &|| crate::dispatch::check_control().is_err())
+            .complete(&s.model, body, output_schema(purpose).as_ref(), None, &|| crate::dispatch::check_control().is_err())
             .map_err(|e| crate::dispatch::NetworkFailure {
                 message: e.message,
                 definitely_unsent: e.not_started,
@@ -881,6 +884,32 @@ fn request_cli_once(
         })
     }, |value| validate_chat_response(value, body, purpose))
     .map_err(|failure| ChatFailure { retryable: failure.retryable, err: anyhow::Error::new(failure) })
+}
+
+/// CLI Provider 的输出结构约束（与 HTTP 的 json_object 契约同义，Codex 原生强制）。
+fn output_schema(purpose: &str) -> Option<serde_json::Value> {
+    let text = serde_json::json!({"type": "string"});
+    match purpose {
+        "proofreading" => Some(serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["segments"],
+            "properties": {"segments": {"type": "array", "items": {
+                "type": "object", "additionalProperties": false, "required": ["id", "text"],
+                "properties": {"id": {"type": "integer"}, "text": text},
+            }}},
+        })),
+        "summary" => Some(serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["tldr", "key_points", "outline"],
+            "properties": {
+                "tldr": text,
+                "key_points": {"type": "array", "items": text},
+                "outline": {"type": "array", "items": {
+                    "type": "object", "additionalProperties": false, "required": ["t", "title", "detail"],
+                    "properties": {"t": {"type": "number"}, "title": text, "detail": text},
+                }},
+            },
+        })),
+        _ => None,
+    }
 }
 
 /// 响应校验（HTTP 与 CLI Provider 共用）：有正文、摘要可解析、校对段落一一对应。

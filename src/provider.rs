@@ -33,7 +33,7 @@ pub(crate) fn endpoint(s: &LlmSettings) -> String {
     match s.provider {
         LlmProvider::Codex => CODEX_RESPONSES_URL.into(),
         // CLI Provider 没有网络地址；请求记录用它区分服务
-        LlmProvider::ClaudeCode => format!("cli://{}", s.provider.as_str()),
+        LlmProvider::ClaudeCode | LlmProvider::CodexCli => format!("cli://{}", s.provider.as_str()),
         _ => crate::llm::endpoint(&s.base_url),
     }
 }

@@ -45,7 +45,7 @@ fn claude_code_returns_the_final_result_text() {
     let runner = CliRunner::new(CliKind::ClaudeCode, fake_cli(dir.path(), CLAUDE_OK, 0));
 
     let body = chat_body("You proofread.", serde_json::json!([{"type": "text", "text": "[{\"id\":\"0\",\"text\":\"fixd\"}]"}]));
-    let text = runner.complete("sonnet", &body, None, &|| false).unwrap();
+    let text = runner.complete("sonnet", &body, None, None, &|| false).unwrap();
 
     assert_eq!(text, r#"{"segments":[{"id":"0","text":"fixed"}]}"#);
     let args = argv(dir.path());
@@ -73,7 +73,7 @@ fn claude_code_error_result_is_reported_not_returned() {
     let dir = tempfile::tempdir().unwrap();
     let out = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Credit balance is too low"}"#;
     let runner = CliRunner::new(CliKind::ClaudeCode, fake_cli(dir.path(), out, 1));
-    let err = runner.complete("sonnet", &text_body(), None, &|| false).unwrap_err();
+    let err = runner.complete("sonnet", &text_body(), None, None, &|| false).unwrap_err();
     assert!(err.message.contains("Credit balance is too low"), "{}", err.message);
     assert!(!err.not_started);
 }
@@ -82,14 +82,14 @@ fn claude_code_error_result_is_reported_not_returned() {
 fn nonzero_exit_without_output_is_an_error_with_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let runner = CliRunner::new(CliKind::ClaudeCode, fake_cli(dir.path(), "", 3));
-    let err = runner.complete("sonnet", &text_body(), None, &|| false).unwrap_err();
+    let err = runner.complete("sonnet", &text_body(), None, None, &|| false).unwrap_err();
     assert!(err.message.contains("exit 3"), "{}", err.message);
 }
 
 #[test]
 fn missing_binary_means_the_request_was_never_sent() {
     let runner = CliRunner::new(CliKind::ClaudeCode, "/nonexistent/claude");
-    let err = runner.complete("sonnet", &text_body(), None, &|| false).unwrap_err();
+    let err = runner.complete("sonnet", &text_body(), None, None, &|| false).unwrap_err();
     assert!(err.not_started);
 }
 
@@ -107,7 +107,7 @@ fn hanging_cli_is_stopped_at_the_timeout() {
     let runner = CliRunner::new(CliKind::ClaudeCode, hanging_cli(dir.path()));
     let started = std::time::Instant::now();
     let err = runner
-        .complete("sonnet", &text_body(), Some(std::time::Duration::from_millis(300)), &|| false)
+        .complete("sonnet", &text_body(), None, Some(std::time::Duration::from_millis(300)), &|| false)
         .unwrap_err();
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert!(err.message.contains("stopped"), "{}", err.message);
@@ -118,7 +118,7 @@ fn cancelling_stops_the_cli() {
     let dir = tempfile::tempdir().unwrap();
     let runner = CliRunner::new(CliKind::ClaudeCode, hanging_cli(dir.path()));
     let started = std::time::Instant::now();
-    let err = runner.complete("sonnet", &text_body(), None, &|| started.elapsed().as_millis() > 200).unwrap_err();
+    let err = runner.complete("sonnet", &text_body(), None, None, &|| started.elapsed().as_millis() > 200).unwrap_err();
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert!(err.message.contains("cancelled"), "{}", err.message);
 }
@@ -133,7 +133,7 @@ fn timeout_still_applies_when_the_cli_never_reads_a_large_input() {
         {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{big}")}},
     ]));
     let started = std::time::Instant::now();
-    let err = runner.complete("sonnet", &body, Some(std::time::Duration::from_millis(300)), &|| false).unwrap_err();
+    let err = runner.complete("sonnet", &body, None, Some(std::time::Duration::from_millis(300)), &|| false).unwrap_err();
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "blocked for {:?}", started.elapsed());
     assert!(err.message.contains("stopped"), "{}", err.message);
 }
@@ -205,4 +205,41 @@ fn cli_provider_is_saved_by_its_kebab_case_name() {
     assert!(text.contains("provider = \"claude-code\""), "{text}");
     let back: course2md::llm::LlmSettings = toml::from_str(&text).unwrap();
     assert_eq!(back.provider, LlmProvider::ClaudeCode);
+}
+
+const CODEX_OK: &str = r#"{"type":"thread.started","thread_id":"t1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"segments\":[{\"id\":0,\"text\":\"fixed\"}]}"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}
+"#;
+
+#[test]
+fn codex_cli_returns_the_agent_message_and_reads_the_prompt_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let runner = CliRunner::new(CliKind::CodexCli, fake_cli(dir.path(), CODEX_OK, 0));
+    let schema = serde_json::json!({"type": "object"});
+    let body = chat_body("You proofread.", serde_json::json!([{"type": "text", "text": "[{\"id\":0,\"text\":\"fixd\"}]"}]));
+
+    let text = runner.complete("gpt-5.5", &body, Some(&schema), None, &|| false).unwrap();
+
+    assert_eq!(text, r#"{"segments":[{"id":0,"text":"fixed"}]}"#);
+    let args = argv(dir.path());
+    assert_eq!(args.first().map(String::as_str), Some("exec"));
+    assert_eq!(args.last().map(String::as_str), Some("-"), "prompt must come from stdin: {args:?}");
+    for expected in ["--json", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral", "read-only", "gpt-5.5", "--output-schema"] {
+        assert!(args.iter().any(|a| a == expected), "missing {expected} in {args:?}");
+    }
+    let stdin = std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap();
+    assert!(stdin.contains("You proofread.") && stdin.contains("fixd"), "{stdin}");
+}
+
+#[test]
+fn codex_cli_failed_turn_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = r#"{"type":"thread.started","thread_id":"t1"}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit"}}
+"#;
+    let runner = CliRunner::new(CliKind::CodexCli, fake_cli(dir.path(), out, 1));
+    let err = runner.complete("gpt-5.5", &text_body(), None, None, &|| false).unwrap_err();
+    assert!(err.message.contains("usage limit"), "{}", err.message);
 }

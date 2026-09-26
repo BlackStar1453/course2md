@@ -22,6 +22,7 @@ const POLL: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliKind {
     ClaudeCode,
+    CodexCli,
 }
 
 impl CliKind {
@@ -29,6 +30,7 @@ impl CliKind {
     pub fn of(provider: LlmProvider) -> Option<Self> {
         match provider {
             LlmProvider::ClaudeCode => Some(Self::ClaudeCode),
+            LlmProvider::CodexCli => Some(Self::CodexCli),
             _ => None,
         }
     }
@@ -37,6 +39,7 @@ impl CliKind {
     pub fn program(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude",
+            Self::CodexCli => "codex",
         }
     }
 
@@ -44,6 +47,7 @@ impl CliKind {
     pub fn env_override(self) -> &'static str {
         match self {
             Self::ClaudeCode => "COURSE2MD_CLAUDE_BIN",
+            Self::CodexCli => "COURSE2MD_CODEX_BIN",
         }
     }
 }
@@ -125,11 +129,13 @@ impl CliRunner {
         &self.binary
     }
 
-    /// 发一次请求，返回模型最终文本。`cancelled` 在等待期间轮询，返回 true 即结束子进程。
+    /// 发一次请求，返回模型最终文本。`output_schema` 约束输出结构（Codex 原生支持；
+    /// Claude Code 靠提示词里的格式说明）。`cancelled` 在等待期间轮询，返回 true 即结束子进程。
     pub fn complete(
         &self,
         model: &str,
         body: &Value,
+        output_schema: Option<&Value>,
         timeout: Option<Duration>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<String, CliError> {
@@ -142,6 +148,31 @@ impl CliRunner {
                 let stdin = claude_stdin(user);
                 let out = run(cmd, Some(stdin), timeout.unwrap_or(DEFAULT_TIMEOUT), cancelled)?;
                 parse_claude(&out)
+            }
+            CliKind::CodexCli => {
+                // 本次调用的临时文件（schema、截图）；函数返回即删除
+                let scratch = tempfile::Builder::new()
+                    .prefix("course2md-codex-")
+                    .tempdir()
+                    .map_err(|e| CliError { message: format!("无法创建临时目录 / Could not create a temp dir: {e}"), not_started: true })?;
+                let (prompt, images) = codex_input(system, user, scratch.path())?;
+                let schema = match output_schema {
+                    Some(schema) => {
+                        let path = scratch.path().join("schema.json");
+                        std::fs::write(&path, schema.to_string()).map_err(|e| CliError {
+                            message: format!("无法写入输出结构 / Could not write the output schema: {e}"),
+                            not_started: true,
+                        })?;
+                        Some(path)
+                    }
+                    None => None,
+                };
+                let mut cmd = Command::new(&self.binary);
+                cmd.args(codex_args(model, schema.as_deref(), &images))
+                    .env_remove("OPENAI_API_KEY")
+                    .env_remove("CODEX_API_KEY");
+                let out = run(cmd, Some(prompt), timeout.unwrap_or(DEFAULT_TIMEOUT), cancelled)?;
+                parse_codex(&out)
             }
         }
     }
@@ -204,6 +235,93 @@ fn claude_image(data_url: &str) -> Value {
         .filter(|m| !m.is_empty())
         .unwrap_or("image/jpeg");
     serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
+}
+
+fn codex_args(model: &str, schema: Option<&std::path::Path>, images: &[PathBuf]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "exec",
+        "--json",
+        // 不加载用户 config.toml 里的插件 / MCP（登录态仍读 CODEX_HOME），冷启动快一倍多
+        "--ignore-user-config",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--sandbox",
+        "read-only",
+        "-c",
+        "model_reasoning_effort=\"low\"",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if !model.trim().is_empty() {
+        args.extend(["--model".into(), model.trim().into()]);
+    }
+    if let Some(schema) = schema {
+        args.extend(["--output-schema".into(), schema.display().to_string()]);
+    }
+    // `--image=路径` 形式：`-i` 可接多个值，会把末尾代表 stdin 的 `-` 当成图片
+    args.extend(images.iter().map(|p| format!("--image={}", p.display())));
+    args.push("-".into());
+    args
+}
+
+/// chat/completions 请求 → Codex 提示文本（系统指令在前）+ 截图临时文件。
+fn codex_input(system: &str, user: &Value, dir: &std::path::Path) -> Result<(String, Vec<PathBuf>), CliError> {
+    use base64::Engine as _;
+    let mut prompt = String::new();
+    if !system.is_empty() {
+        prompt.push_str(system);
+        prompt.push_str("\n\n");
+    }
+    let mut images = Vec::new();
+    let parts: Vec<Value> = match user {
+        Value::Array(parts) => parts.clone(),
+        Value::String(text) => vec![serde_json::json!({"type": "text", "text": text})],
+        other => vec![serde_json::json!({"type": "text", "text": other.to_string()})],
+    };
+    for part in &parts {
+        if part["type"] == "image_url" {
+            let url = part["image_url"]["url"].as_str().unwrap_or_default();
+            let (meta, data) = url.split_once(',').unwrap_or(("", url));
+            let ext = if meta.contains("png") { "png" } else { "jpg" };
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| CliError {
+                message: format!("截图数据无效 / Invalid screenshot data: {e}"),
+                not_started: true,
+            })?;
+            let path = dir.join(format!("image-{}.{ext}", images.len()));
+            std::fs::write(&path, bytes).map_err(|e| CliError {
+                message: format!("无法写入截图 / Could not write the screenshot: {e}"),
+                not_started: true,
+            })?;
+            images.push(path);
+        } else if let Some(text) = part["text"].as_str() {
+            prompt.push_str(text);
+            prompt.push('\n');
+        }
+    }
+    Ok((prompt, images))
+}
+
+/// Codex `exec --json` 事件流 → 最终文本（最后一条 agent_message）。
+fn parse_codex(out: &Output) -> Result<String, CliError> {
+    let mut last: Option<String> = None;
+    for line in out.stdout.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else { continue };
+        match event["type"].as_str() {
+            Some("item.completed") if event["item"]["type"] == "agent_message" => {
+                last = event["item"]["text"].as_str().map(str::to_owned);
+            }
+            Some("turn.failed") | Some("error") => {
+                let message = event["error"]["message"].as_str().or_else(|| event["message"].as_str()).unwrap_or_default();
+                return Err(failed(format!("Codex 返回错误 / Codex returned an error: {}", excerpt(message))));
+            }
+            _ => {}
+        }
+    }
+    match last.filter(|t| !t.trim().is_empty()) {
+        Some(text) => Ok(text),
+        None => Err(failed(format!("Codex 没有返回内容 / Codex returned no content{}", out.describe_exit()))),
+    }
 }
 
 /// Claude stream-json 输出 → 最终文本。
