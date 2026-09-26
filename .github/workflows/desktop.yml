@@ -38,6 +38,22 @@ jobs:
           else
             python desktop/scripts/sources.py
           fi
+      # Fork-only: reuse compiled dependencies between pushes (cold build ~21 min).
+      - name: Restore macOS compiler cache
+        if: runner.os == 'macOS'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/target
+            !target/debug/incremental
+            !desktop/target/debug/incremental
+          key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock') }}-
+            desktop-macos-
       - name: Check and test desktop
         run: cargo test --manifest-path desktop/Cargo.toml
       - name: Build development packages
@@ -48,6 +64,19 @@ jobs:
         run: |
           cargo build
           cargo build --manifest-path desktop/Cargo.toml
+      # Fork-only: save before the disk-image step deletes target/debug/deps.
+      - name: Save macOS compiler cache
+        if: github.ref_type != 'tag' && runner.os == 'macOS'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            desktop/target
+            !target/debug/incremental
+            !desktop/target/debug/incremental
+          key: desktop-macos-${{ hashFiles('Cargo.lock', 'desktop/Cargo.lock') }}-${{ github.run_id }}
       - name: Free completed compiler caches before creating the disk image
         if: github.ref_type != 'tag' && runner.os == 'macOS'
         run: |
