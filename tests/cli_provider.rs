@@ -337,3 +337,27 @@ fn a_failure_without_result_text_still_says_what_went_wrong() {
     let err = runner.complete("sonnet", &text_body(), None, None, &|| false).unwrap_err();
     assert!(err.message.contains("error_max_turns"), "{}", err.message);
 }
+
+fn pid_alive(pid: i32) -> bool {
+    std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())
+}
+
+/// npm-installed `claude` / `codex` are wrappers that start the real worker as a child;
+/// stopping only the wrapper would leave the worker running on the subscription.
+#[test]
+fn stopping_the_cli_also_stops_programs_it_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("grandchild.pid");
+    let script = dir.path().join("wrapper");
+    std::fs::write(&script, format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n", pidfile.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let runner = CliRunner::new(CliKind::ClaudeCode, script);
+
+    // Stop once the worker is known to be running (timeout and cancel share the same stop path).
+    let started = || std::fs::read_to_string(&pidfile).is_ok_and(|p| !p.trim().is_empty());
+    runner.complete("sonnet", &text_body(), None, Some(std::time::Duration::from_secs(20)), &started).unwrap_err();
+
+    let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!pid_alive(pid), "grandchild {pid} still running");
+}

@@ -427,6 +427,13 @@ fn run(
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // 自成进程组：npm 装的 claude / codex 是包装脚本，真正干活的是它启动的子进程，
+    // 超时或取消时要连同它们一起结束，否则会在后台继续消耗订阅额度
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| not_started(format!("无法启动 CLI / Could not start the CLI: {e}")))?;
@@ -486,7 +493,15 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<St
     })
 }
 
+/// 结束 CLI 及其启动的所有进程（整个进程组）。
 fn kill(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: 负 pid 表示向进程组发信号；该进程组由本进程创建（process_group(0)），组号即子进程 pid
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
