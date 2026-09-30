@@ -13,11 +13,12 @@ const STAGE_BADGE = {
   download: "下载",
   subtitle: "字幕",
   model: "模型",
-  prepare: "模型",
   audio: "音频",
   transcribe: "识别",
   llm: "校对",
   scenes: "截图",
+  summary: "摘要",
+  render: "导出",
 };
 
 // ---------- 任务状态（持久化，每个任务一个 key） ----------
@@ -320,7 +321,8 @@ async function startConvert(id, input) {
 
   port.onMessage.addListener(async (msg) => {
     if (msg.type === "stage") {
-      setBadge(STAGE_BADGE[msg.stage] || "处理");
+      // 阶段名可能带子阶段，如 model/prepare、scenes/scan，按前缀取。
+      setBadge(STAGE_BADGE[String(msg.stage).split("/")[0]] || "处理");
     } else if (msg.type === "done") {
       finished = true;
       const done = await updateJob(id, (j) => {
