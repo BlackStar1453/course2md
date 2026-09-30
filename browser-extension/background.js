@@ -1,5 +1,10 @@
 // course2md 浏览器扩展：工具栏按钮 → 取当前页视频 → 经 Native Messaging 交给本机 course2md。
-// 服务工作线程可能随时被回收，任务状态一律存 chrome.storage.local，监听器都在顶层注册。
+//
+// 视频不走 Chrome 下载：在页面里 fetch（带页面自己的 Referer，CDN 才肯给），
+// 分块经 runtime 消息转给桥接程序，由它直接写进 ~/Movies/course2md-videos/。
+// 这样避开了：CDN 拒绝扩展直接下载、Chrome「多次自动下载」拦截、macOS「下载」文件夹权限弹窗。
+//
+// 打开的 Native 端口会让服务工作线程一直存活；所以线程一旦重启，说明之前的连接都已断开。
 
 const HOST = "com.course2md.host";
 // course2md 自己能处理这些站点的链接（登录 / 字幕），直接交页面网址。
@@ -7,7 +12,7 @@ const NATIVE_SITES = ["bilibili.com", "b23.tv", "youtube.com", "youtu.be"];
 // 通知必须带图标；用内联的 1x1 PNG，免得扩展里放图片文件。
 const ICON =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-const ACTIVE = ["starting", "downloading", "converting"];
+const ACTIVE = ["starting", "uploading", "converting"];
 const STAGE_BADGE = {
   fetch: "获取",
   download: "下载",
@@ -21,60 +26,40 @@ const STAGE_BADGE = {
   render: "导出",
 };
 
-// ---------- 任务状态（持久化，每个任务一个 key） ----------
+// 本线程内活着的任务：jobId → Native 端口。只有这里有的任务才算「正在处理」。
+const ports = new Map();
+
+// ---------- 任务状态（持久化，每个任务一个 key；只用于点通知时找笔记） ----------
 
 const KEY = (id) => `job:${id}`;
-
-// 所有「读-改-写」串行执行，避免多个监听器同时改状态互相覆盖。
-let queue = Promise.resolve();
-function locked(fn) {
-  const run = queue.then(fn, fn);
-  queue = run.catch(() => {});
-  return run;
-}
 
 async function getJob(id) {
   const data = await chrome.storage.local.get(KEY(id));
   return data[KEY(id)] || null;
 }
 
-async function allJobs() {
-  const data = await chrome.storage.local.get(null);
-  return Object.keys(data)
-    .filter((k) => k.startsWith("job:"))
-    .map((k) => data[k]);
-}
-
-async function findJob(pred) {
-  return (await allJobs()).find(pred) || null;
-}
-
 function putJob(job) {
   return chrome.storage.local.set({ [KEY(job.id)]: job });
 }
 
-// 在锁内读最新状态、改、写回；fn 返回 false 表示不改。
-function updateJob(id, fn) {
-  return locked(async () => {
-    const job = await getJob(id);
-    if (!job || fn(job) === false) return null;
-    await putJob(job);
-    return job;
-  });
+async function patchJob(id, fields) {
+  const job = await getJob(id);
+  if (!job) return null;
+  Object.assign(job, fields);
+  await putJob(job);
+  return job;
 }
 
-// 浏览器重启后，上次没结束的任务已经没有连接可接了，标记为中断，允许重新点击。
-chrome.runtime.onStartup.addListener(() =>
-  locked(async () => {
-    for (const job of await allJobs()) {
-      if (ACTIVE.includes(job.status)) {
-        job.status = "interrupted";
-        await putJob(job);
-      }
+// 线程刚启动时没有任何活着的端口；存储里还标着进行中的任务都已断开，标记为中断。
+(async () => {
+  const data = await chrome.storage.local.get(null);
+  for (const [k, job] of Object.entries(data)) {
+    if (k.startsWith("job:") && ACTIVE.includes(job.status) && !ports.has(job.id)) {
+      job.status = "interrupted";
+      await putJob(job);
     }
-    setBadge("");
-  })
-);
+  }
+})();
 
 // ---------- 小工具 ----------
 
@@ -87,7 +72,6 @@ function isNativeSite(url) {
   }
 }
 
-// downloads API 只收相对路径；去掉分隔符、控制字符和文件系统非法字符，并限制长度。
 function safeName(title) {
   const name = (title || "")
     .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, " ")
@@ -106,22 +90,34 @@ function setBadge(text) {
   chrome.action.setBadgeText({ text: text || "" });
 }
 
+async function finish(id, fields) {
+  const port = ports.get(id);
+  ports.delete(id);
+  if (port) {
+    try {
+      port.disconnect();
+    } catch {
+      // 已断开
+    }
+  }
+  if (!ports.size) setBadge("");
+  return patchJob(id, fields);
+}
+
 async function fail(id, message) {
-  const job = await updateJob(id, (j) => {
-    j.status = "failed";
-    j.error = message;
-  });
-  setBadge("");
+  const job = await finish(id, { status: "failed", error: message });
   notify(id, "course2md 转换失败", `${(job && job.title) || ""}\n${message}`);
 }
 
 // ---------- 入口：点工具栏按钮 ----------
 
 chrome.action.onClicked.addListener(async (tab) => {
-  const running = await findJob((j) => j.pageUrl === tab.url && ACTIVE.includes(j.status));
-  if (running) {
-    notify(`dup-${Date.now()}`, "course2md", "这个页面已经在处理中了");
-    return;
+  for (const id of ports.keys()) {
+    const job = await getJob(id);
+    if (job && job.pageUrl === tab.url) {
+      notify(`dup-${Date.now()}`, "course2md", "这个页面已经在处理中了");
+      return;
+    }
   }
   const job = {
     id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
@@ -130,10 +126,10 @@ chrome.action.onClicked.addListener(async (tab) => {
     title: safeName(tab.title),
     status: "starting",
   };
-  await locked(() => putJob(job));
+  await putJob(job);
 
   if (isNativeSite(tab.url)) {
-    return startConvert(job.id, { source: tab.url, isFile: false });
+    return convertUrl(job, tab.url);
   }
 
   let picked;
@@ -146,10 +142,10 @@ chrome.action.onClicked.addListener(async (tab) => {
   if (!picked) return fail(job.id, "这个页面上没找到视频");
 
   if (/^https?:/i.test(picked.src)) {
-    return downloadDirect(job.id, picked.src);
+    return uploadFromPage(job, picked.src);
   }
   // blob: / MediaSource 流拿不到文件地址，退回交页面网址，由 course2md（yt-dlp）试着解析。
-  return startConvert(job.id, { source: tab.url, isFile: false });
+  return convertUrl(job, tab.url);
 });
 
 // 注入页面执行：优先正在播放的视频，否则取画面最大的。
@@ -163,192 +159,150 @@ function pickVideo() {
   return { src: best.currentSrc || best.src };
 }
 
-// ---------- 下载：先用 downloads API，失败再在页面里 fetch ----------
+// ---------- 连接桥接程序 ----------
 
-async function downloadDirect(id, src) {
-  const job = await updateJob(id, (j) => {
-    j.status = "downloading";
-    j.videoSrc = src;
-  });
-  setBadge("下载");
-  let downloadId;
-  try {
-    downloadId = await chrome.downloads.download({
-      url: src,
-      filename: `course2md/${job.title}-${job.id}.mp4`,
-      conflictAction: "uniquify",
-      saveAs: false,
-    });
-  } catch (e) {
-    return downloadInPage(id);
-  }
-  await updateJob(id, (j) => {
-    j.downloadId = downloadId;
-  });
-  // 小文件可能在 downloadId 写入前就下完了，那次 onChanged 会找不到任务；这里补查一次。
-  const [item] = await chrome.downloads.search({ id: downloadId });
-  if (item) handleDownloadState(downloadId, item.state);
-}
-
-// 在页面上下文里 fetch（带页面自己的 Referer），再用 <a download> 存下来；
-// 由 onDeterminingFilename 按「页面来源的 blob: 地址 + 登记的文件名」认领并改名。
-async function downloadInPage(id) {
-  let alreadyTried = false;
-  const job = await updateJob(id, (j) => {
-    if (j.fallbackTried) {
-      alreadyTried = true;
-      return false;
-    }
-    j.fallbackTried = true;
-    j.downloadId = null;
-    j.fallbackName = `course2md-${j.id}.mp4`;
-  });
-  if (alreadyTried) return fail(id, "视频下载失败（直接下载和页面内下载都不行）");
-  if (!job) return;
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId: job.tabId },
-      func: fetchInPage,
-      args: [job.videoSrc, job.fallbackName],
-    });
-    const r = res && res.result;
-    if (!r || !r.ok) return fail(id, `页面内下载失败：${(r && r.error) || "未知原因"}`);
-  } catch (e) {
-    return fail(id, `页面内下载失败：${e.message}`);
-  }
-}
-
-async function fetchInPage(src, name) {
-  try {
-    // 不带 credentials: "include"：视频 CDN 多为跨域，带凭据会要求 CDN 额外放行，反而失败。
-    const resp = await fetch(src);
-    if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
-    const blob = await resp.blob();
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 120000);
-    return { ok: true, size: blob.size };
-  } catch (e) {
-    return { ok: false, error: String(e && e.message) };
-  }
-}
-
-function originOf(url) {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return null;
-  }
-}
-
-// 注册后会拦到所有下载，所以每个下载都必须调用 suggest()（包括出错时），不相关的原样放行。
-chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  const base = (item.filename || "").split(/[\\/]/).pop();
-  if (!/^course2md-[a-z0-9]+\.mp4$/.test(base) || !item.url.startsWith("blob:")) {
-    suggest();
-    return;
-  }
-  locked(async () => {
-    const job = await findJob((j) => j.fallbackName === base);
-    // 只认领：仍在下载中、还没关联下载、且 blob 来自该任务页面的同源。
-    if (!job || job.status !== "downloading" || job.downloadId != null ||
-        !item.url.startsWith(`blob:${originOf(job.pageUrl)}/`)) {
-      return null;
-    }
-    job.downloadId = item.id;
-    job.fallbackName = null; // 一次性消费
-    await putJob(job);
-    return job;
-  })
-    .then((job) => {
-      if (job) suggest({ filename: `course2md/${job.title}-${job.id}.mp4`, conflictAction: "uniquify" });
-      else suggest();
-    })
-    .catch(() => suggest());
-  return true;
-});
-
-chrome.downloads.onChanged.addListener((delta) => {
-  if (delta.state) handleDownloadState(delta.id, delta.state.current);
-});
-
-// onChanged 和 downloadDirect 的补查都会走到这里；靠状态迁移保证只处理一次。
-async function handleDownloadState(downloadId, state) {
-  if (state !== "complete" && state !== "interrupted") return;
-  const job = await findJob((j) => j.downloadId === downloadId && j.status === "downloading");
-  if (!job) return;
-  if (state === "interrupted") {
-    // 同样先认领，避免 onChanged 和补查各触发一次回退、第二次被误判为「两种都失败」。
-    const claimedFail = await updateJob(job.id, (j) => {
-      if (j.status !== "downloading" || j.downloadId !== downloadId) return false;
-      j.downloadId = null;
-    });
-    if (claimedFail) return downloadInPage(job.id);
-    return;
-  }
-  const claimed = await updateJob(job.id, (j) => {
-    if (j.status !== "downloading" || j.downloadId !== downloadId) return false;
-    j.status = "converting";
-  });
-  if (!claimed) return;
-  // 以 Chrome 实际保存的绝对路径为准（可能因重名被改过）。
-  const [item] = await chrome.downloads.search({ id: downloadId });
-  if (!item || !item.filename) return fail(job.id, "找不到下载好的视频文件");
-  return startConvert(job.id, { source: item.filename, isFile: true });
-}
-
-// ---------- 转换：连本机桥接程序 ----------
-
-async function startConvert(id, input) {
-  const job = await updateJob(id, (j) => {
-    j.status = "converting";
-  });
-  if (!job) return;
-  setBadge("开始");
-  notify(id, "course2md 开始转换", job.title);
-
+// 打开端口并挂好转换阶段的消息处理；失败返回 null（已通知）。
+async function openHost(job) {
   let port;
   try {
     port = chrome.runtime.connectNative(HOST);
   } catch (e) {
-    return fail(id, `连不上本机桥接程序：${e.message}（运行过 host/install.sh 吗？）`);
+    await fail(job.id, `连不上本机桥接程序：${e.message}（运行过 host/install.sh 吗？）`);
+    return null;
   }
-  let finished = false;
+  ports.set(job.id, port);
 
   port.onMessage.addListener(async (msg) => {
     if (msg.type === "stage") {
-      // 阶段名可能带子阶段，如 model/prepare、scenes/scan，按前缀取。
+      if (msg.stage === "fetch") await patchJob(job.id, { status: "converting" });
       setBadge(STAGE_BADGE[String(msg.stage).split("/")[0]] || "处理");
     } else if (msg.type === "done") {
-      finished = true;
-      const done = await updateJob(id, (j) => {
-        j.status = msg.partial ? "partial" : "done";
-        j.html = msg.html || null;
-        j.noteTitle = msg.title || j.title;
+      const done = await finish(job.id, {
+        status: msg.partial ? "partial" : "done",
+        html: msg.html || null,
+        noteTitle: msg.title || job.title,
       });
-      setBadge("");
       const extra = msg.problems && msg.problems.length ? `\n部分步骤失败：${msg.problems.join("、")}` : "";
       const tail = msg.html ? "\n点击打开笔记" : "\n没有生成网页版，请在 course2md 笔记库里查看";
-      notify(id, msg.partial ? "course2md 已完成（有步骤失败）" : "course2md 已完成",
+      notify(job.id, msg.partial ? "course2md 已完成（有步骤失败）" : "course2md 已完成",
         `${(done && done.noteTitle) || job.title}${extra}${tail}`);
     } else if (msg.type === "error") {
-      finished = true;
-      await fail(id, msg.message || "未知错误");
+      await fail(job.id, msg.message || "未知错误");
     }
   });
 
   port.onDisconnect.addListener(async () => {
-    if (finished) return;
+    if (!ports.has(job.id)) return; // 已正常结束
     const why = chrome.runtime.lastError ? chrome.runtime.lastError.message : "连接中断";
     // 桥接程序让 course2md 在独立进程组里跑，连接断了转换也可能还在继续。
-    await fail(id, `${why}。若转换已开始，完成后仍可在 course2md 笔记库「未分类」里找到`);
+    await fail(job.id, `${why}。若转换已开始，完成后仍可在 course2md 笔记库「未分类」里找到`);
   });
 
-  port.postMessage({ type: "convert", jobId: id, source: input.source, isFile: input.isFile, title: job.title });
+  setBadge("开始");
+  notify(job.id, "course2md 开始处理", job.title);
+  return port;
+}
+
+async function convertUrl(job, url) {
+  const port = await openHost(job);
+  if (!port) return;
+  await patchJob(job.id, { status: "converting" });
+  port.postMessage({ type: "convert", source: url, title: job.title });
+}
+
+// ---------- 视频：页面里 fetch，分块传给桥接程序 ----------
+
+async function uploadFromPage(job, src) {
+  const port = await openHost(job);
+  if (!port) return;
+  await patchJob(job.id, { status: "uploading" });
+  setBadge("传输");
+  port.postMessage({ type: "begin", title: job.title });
+
+  let r;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: job.tabId },
+      func: sendVideoChunks,
+      args: [src, job.id],
+    });
+    r = res && res.result;
+  } catch (e) {
+    r = { ok: false, error: e.message };
+  }
+  if (!ports.has(job.id)) return; // 传输途中桥接程序已报错 / 断开
+  if (!r || !r.ok) {
+    port.postMessage({ type: "abort" });
+    return fail(job.id, `视频传输失败：${(r && r.error) || "未知原因"}`);
+  }
+  await patchJob(job.id, { status: "converting" });
+  port.postMessage({ type: "end", size: r.size });
+}
+
+// 页面里转来的视频分块，原样转给该任务的桥接程序；回复 false 让页面停止。
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== "course2md-chunk") return;
+  const port = ports.get(msg.jobId);
+  if (!port) {
+    sendResponse(false);
+    return;
+  }
+  port.postMessage({ type: "chunk", data: msg.data });
+  sendResponse(true);
+});
+
+// 注入页面执行（隔离环境，可用 chrome.runtime）。
+// 在页面上下文里 fetch，才带得上页面的 Referer；不带 credentials，免得跨域 CDN 要求额外放行。
+// 每块约 4MB，转成 base64 发给扩展；2 分钟没有新数据就放弃，免得任务卡死。
+async function sendVideoChunks(src, jobId) {
+  const CHUNK = 4 * 1024 * 1024;
+  const STALL_MS = 120000;
+  const ctrl = new AbortController();
+  let timer = setTimeout(() => ctrl.abort(), STALL_MS);
+  const kick = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => ctrl.abort(), STALL_MS);
+  };
+  const toBase64 = (bytes) =>
+    new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result).split(",", 2)[1] || "");
+      fr.onerror = () => reject(fr.error);
+      fr.readAsDataURL(new Blob([bytes]));
+    });
+  const flush = async (parts) => {
+    const data = await toBase64(new Blob(parts));
+    const ok = await chrome.runtime.sendMessage({ type: "course2md-chunk", jobId, data });
+    if (!ok) throw new Error("扩展端已停止接收");
+  };
+  try {
+    const resp = await fetch(src, { signal: ctrl.signal });
+    if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
+    const reader = resp.body.getReader();
+    let parts = [];
+    let pending = 0;
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      kick();
+      parts.push(value);
+      pending += value.byteLength;
+      size += value.byteLength;
+      if (pending >= CHUNK) {
+        await flush(parts);
+        parts = [];
+        pending = 0;
+      }
+    }
+    if (pending) await flush(parts);
+    if (!size) return { ok: false, error: "下载到的视频是空的" };
+    return { ok: true, size };
+  } catch (e) {
+    return { ok: false, error: ctrl.signal.aborted ? "2 分钟没有收到新数据，已放弃" : String(e && e.message) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------- 点通知：让桥接程序打开笔记网页版 ----------

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "course2md",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "把当前页面正在播放的视频交给本机 course2md，转成带截图和时间戳的图文笔记。",
   "minimum_chrome_version": "105",
   "action": {
@@ -13,7 +13,6 @@
   "permissions": [
     "activeTab",
     "scripting",
-    "downloads",
     "nativeMessaging",
     "notifications",
     "storage"
