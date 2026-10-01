@@ -7,8 +7,8 @@
 收到的消息（一次连接只做一件事）：
   {"type": "convert", "source", "title"}      把网址交给 course2md
   {"type": "begin", "title"}                  开始接收视频，随后：
-    {"type": "chunk", "data": <base64>} ...   视频分块（扩展在页面里下载后转来）
-    {"type": "end"} / {"type": "abort"}       收完则转换本地文件 / 放弃并删掉半成品
+    {"type": "chunk", "index", "data": <base64>} ...  视频分块，index 区分画面 / 声音等不同文件
+    {"type": "end", "ok": [index...]} / {"type": "abort"}  收完则拼成一个视频再转换 / 放弃并删掉半成品
   {"type": "open", "path"}                    打开笔记网页版
 发出的消息：
   {"type": "stage", "stage"} / {"type": "done", ...} / {"type": "error", "message"}
@@ -18,6 +18,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -97,44 +98,125 @@ def safe_name(title):
     return name or "video"
 
 
-def receive_video(title):
-    """接收扩展转来的视频分块，写进 VIDEO_DIR，按页面标题命名（course2md 用文件名当笔记标题）。
+def tool(name):
+    """Chrome 拉起的进程 PATH 很短，ffprobe / ffmpeg 要去 Homebrew 目录找。"""
+    for d in ("/opt/homebrew/bin", "/usr/local/bin"):
+        if os.path.isfile(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return shutil.which(name)
 
-    先写 .part，收到 end 才改成正式文件名；abort / 断开 / 出错则删掉半成品。返回正式路径或 None。
+
+def probe(path):
+    """返回 (有画面, 有声音, 时长秒)；没有 ffprobe 或读失败时返回 None。"""
+    ffprobe = tool("ffprobe")
+    if not ffprobe:
+        return None
+    r = subprocess.run([ffprobe, "-v", "error", "-show_entries", "stream=codec_type:format=duration",
+                        "-of", "json", str(path)], capture_output=True, text=True)
+    try:
+        info = json.loads(r.stdout)
+    except ValueError:
+        return None
+    kinds = {st.get("codec_type") for st in info.get("streams", [])}
+    try:
+        duration = float(info.get("format", {}).get("duration") or 0)
+    except ValueError:
+        duration = 0.0
+    return ("video" in kinds, "audio" in kinds, duration)
+
+
+def assemble(files, dest):
+    """从收到的文件里拼出一个有画面有声音的视频，写到 dest。返回 (路径, 是否只有声音)。
+
+    - 有文件同时有画面和声音：直接用它
+    - 一个只有画面、一个只有声音，且时长相近：ffmpeg 只合并不重新编码
+    - 否则退而求其次：优先用有声音的（文字稿要靠它），没有截图
+    """
+    infos = [(f, probe(f)) for f in files]
+    if any(info is None for _, info in infos):
+        best = max(files, key=lambda f: f.stat().st_size)
+        best.rename(dest)
+        return dest, False
+    both = [f for f, (v, a, _) in infos if v and a]
+    if both:
+        max(both, key=lambda f: f.stat().st_size).rename(dest)
+        return dest, False
+    video = next(((f, d) for f, (v, a, d) in infos if v), None)
+    audio = next(((f, d) for f, (v, a, d) in infos if a), None)
+    if video and audio and abs(video[1] - audio[1]) <= 2:
+        r = subprocess.run([tool("ffmpeg") or "ffmpeg", "-v", "error", "-y", "-i", str(video[0]), "-i", str(audio[0]),
+                            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", str(dest)],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and dest.is_file():
+            log(f"已合并画面与声音 → {dest}")
+            return dest, False
+        log(f"合并失败：{r.stderr.strip()[-300:]}")
+    if audio:
+        audio[0].rename(dest)
+        return dest, True
+    video[0].rename(dest)
+    return dest, False
+
+
+def receive_video(title):
+    """接收扩展转来的视频分块（可能有多个文件，按 index 区分），在 VIDEO_DIR 里拼成一个视频，
+    按页面标题命名（course2md 用文件名当笔记标题）。
+
+    分块先写 .part，收到 end 才处理；abort / 断开 / 出错则删掉半成品。返回 (路径, 是否只有声音) 或 None。
     """
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     stem = safe_name(title)
-    part = VIDEO_DIR / f".{stem}.{os.getpid()}.part"
-    size = 0
+    parts, handles, sizes = {}, {}, {}
+
+    def cleanup():
+        for h in handles.values():
+            h.close()
+        for f in parts.values():
+            f.unlink(missing_ok=True)
+
     try:
-        with open(part, "wb") as f:
-            while True:
-                msg = read_message()
-                kind = msg and msg.get("type")
-                if kind == "chunk":
-                    data = base64.b64decode(msg.get("data") or "")
-                    f.write(data)
-                    size += len(data)
-                elif kind == "end":
-                    break
-                else:
-                    log(f"接收中止：{kind or '扩展断开'}，已收 {size} 字节")
-                    part.unlink(missing_ok=True)
-                    return None
-        if not size:
-            part.unlink(missing_ok=True)
+        while True:
+            msg = read_message()
+            kind = msg and msg.get("type")
+            if kind == "chunk":
+                i = int(msg.get("index") or 0)
+                if i not in handles:
+                    parts[i] = VIDEO_DIR / f".{stem}.{os.getpid()}.{i}.part"
+                    handles[i] = open(parts[i], "wb")
+                    sizes[i] = 0
+                data = base64.b64decode(msg.get("data") or "")
+                handles[i].write(data)
+                sizes[i] += len(data)
+            elif kind == "end":
+                break
+            else:
+                log(f"接收中止：{kind or '扩展断开'}，已收 {sizes}")
+                cleanup()
+                return None
+        for h in handles.values():
+            h.close()
+        handles.clear()
+        ok = {int(i) for i in (msg.get("ok") or [])}
+        files = [parts[i] for i in sorted(parts) if i in ok and sizes[i] > 0]
+        for i in parts:
+            if parts[i] not in files:
+                parts[i].unlink(missing_ok=True)
+        if not files:
             send({"type": "error", "message": "收到的视频是空的"})
             return None
+        log(f"已接收 {len(files)} 个文件，字节数 {[sizes[i] for i in sorted(parts) if parts[i] in files]}")
         dest = VIDEO_DIR / f"{stem}.mp4"
         n = 2
         while dest.exists():
             dest = VIDEO_DIR / f"{stem} ({n}).mp4"
             n += 1
-        part.rename(dest)
-        log(f"已接收视频 {size} 字节 → {dest}")
-        return dest
+        result = assemble(files, dest)
+        for f in files:
+            f.unlink(missing_ok=True)  # 合并后剩下的半成品
+        log(f"视频就绪 → {result[0]}{'（只有声音）' if result[1] else ''}")
+        return result
     except (OSError, ValueError) as e:
-        part.unlink(missing_ok=True)
+        cleanup()
         send({"type": "error", "message": f"保存视频失败：{e}"})
         return None
 
@@ -162,7 +244,7 @@ def problems_of(outcomes):
     return bad
 
 
-def convert(source):
+def convert(source, audio_only=False):
     if not CLI.is_file():
         return send({"type": "error", "message": f"没找到 {CLI}，请先安装 course2md"})
 
@@ -207,6 +289,8 @@ def convert(source):
 
     html = find_html(done)
     problems = problems_of(done.get("outcomes"))
+    if audio_only:
+        problems.append("只拿到声音，没有截图")
     if not html and "exports.html" not in problems:
         problems.append("exports.html")
     send({"type": "done", "title": done.get("title"), "html": html,
@@ -238,9 +322,9 @@ def main():
     elif kind == "begin":
         if not CLI.is_file():
             return send({"type": "error", "message": f"没找到 {CLI}，请先安装 course2md"})
-        video = receive_video(msg.get("title"))
-        if video:
-            convert(str(video))
+        received = receive_video(msg.get("title"))
+        if received:
+            convert(str(received[0]), audio_only=received[1])
     elif kind == "open":
         open_note(msg)
     else:

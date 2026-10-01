@@ -141,8 +141,8 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
   if (!picked) return fail(job.id, "这个页面上没找到视频");
 
-  if (/^https?:/i.test(picked.src)) {
-    return uploadFromPage(job, picked.src);
+  if (picked.srcs.length) {
+    return uploadFromPage(job, picked.srcs);
   }
   // blob: / MediaSource 流拿不到文件地址，退回交页面网址，由 course2md（yt-dlp）试着解析。
   return convertUrl(job, tab.url);
@@ -157,16 +157,26 @@ function pickVideo() {
   const pool = playing.length ? playing : videos;
   const best = pool.sort((a, b) => area(b) - area(a))[0];
   const src = best.currentSrc || best.src;
-  if (!src.startsWith("blob:")) return { src };
-  // blob: 视频流（MediaSource）没有文件地址；但抖音这类网站流里分段请求的仍是一个完整 mp4，
-  // 从页面的网络请求记录里找最近一次请求的 mp4 地址，不带 Range 再取一次就是整个文件。
+  if (/^https?:/i.test(src)) return { srcs: [src] };
+  // blob: 视频流（MediaSource）没有文件地址；但抖音这类网站流里分段请求的仍是完整 mp4，
+  // 而且画面和声音常是两个独立的 mp4。从页面的网络请求记录里取最近请求的 2 个不同 mp4
+  // （按路径去重，同一文件的分段请求只算一个），不带 Range 再取一次就是整个文件，
+  // 由桥接程序判断哪个是画面、哪个是声音并合并。
   // 只认完整 mp4（.mp4 或 mime_type=video_mp4）；HLS / DASH 分片拿不到整片，交回页面网址处理。
-  const mp4 = performance
+  const seen = new Set();
+  const srcs = [];
+  const urls = performance
     .getEntriesByType("resource")
     .map((e) => e.name)
-    .filter((u) => /^https?:/i.test(u) && /mime_type=video_mp4|\.mp4(\?|$)/i.test(u))
-    .pop();
-  return { src: mp4 || src };
+    .filter((u) => /^https?:/i.test(u) && /mime_type=video_mp4|\.mp4(\?|$)/i.test(u));
+  for (const u of urls.reverse()) {
+    const key = new URL(u).origin + new URL(u).pathname;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    srcs.push(u);
+    if (srcs.length === 2) break;
+  }
+  return { srcs };
 }
 
 // ---------- 连接桥接程序 ----------
@@ -222,31 +232,39 @@ async function convertUrl(job, url) {
 
 // ---------- 视频：页面里 fetch，分块传给桥接程序 ----------
 
-async function uploadFromPage(job, src) {
+// 逐个传输候选文件（通常 1 个；视频流网站可能是画面 + 声音 2 个）。
+// 某个失败就跳过它，至少传成功一个才继续；end 里告诉桥接程序哪些文件是完整的。
+async function uploadFromPage(job, srcs) {
   const port = await openHost(job);
   if (!port) return;
   await patchJob(job.id, { status: "uploading" });
   setBadge("传输");
   port.postMessage({ type: "begin", title: job.title });
 
-  let r;
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId: job.tabId },
-      func: sendVideoChunks,
-      args: [src, job.id],
-    });
-    r = res && res.result;
-  } catch (e) {
-    r = { ok: false, error: e.message };
+  const ok = [];
+  let lastError = "";
+  for (let index = 0; index < srcs.length; index++) {
+    let r;
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: job.tabId },
+        func: sendVideoChunks,
+        args: [srcs[index], job.id, index],
+      });
+      r = res && res.result;
+    } catch (e) {
+      r = { ok: false, error: e.message };
+    }
+    if (!ports.has(job.id)) return; // 传输途中桥接程序已报错 / 断开
+    if (r && r.ok) ok.push(index);
+    else lastError = (r && r.error) || "未知原因";
   }
-  if (!ports.has(job.id)) return; // 传输途中桥接程序已报错 / 断开
-  if (!r || !r.ok) {
+  if (!ok.length) {
     port.postMessage({ type: "abort" });
-    return fail(job.id, `视频传输失败：${(r && r.error) || "未知原因"}`);
+    return fail(job.id, `视频传输失败：${lastError}`);
   }
   await patchJob(job.id, { status: "converting" });
-  port.postMessage({ type: "end", size: r.size });
+  port.postMessage({ type: "end", ok });
 }
 
 // 页面里转来的视频分块，原样转给该任务的桥接程序；回复 false 让页面停止。
@@ -257,14 +275,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse(false);
     return;
   }
-  port.postMessage({ type: "chunk", data: msg.data });
+  port.postMessage({ type: "chunk", index: msg.index, data: msg.data });
   sendResponse(true);
 });
 
 // 注入页面执行（隔离环境，可用 chrome.runtime）。
 // 在页面上下文里 fetch，才带得上页面的 Referer；不带 credentials，免得跨域 CDN 要求额外放行。
 // 每块约 4MB，转成 base64 发给扩展；2 分钟没有新数据就放弃，免得任务卡死。
-async function sendVideoChunks(src, jobId) {
+async function sendVideoChunks(src, jobId, index) {
   const CHUNK = 4 * 1024 * 1024;
   const STALL_MS = 120000;
   const ctrl = new AbortController();
@@ -282,7 +300,7 @@ async function sendVideoChunks(src, jobId) {
     });
   const flush = async (parts) => {
     const data = await toBase64(new Blob(parts));
-    const ok = await chrome.runtime.sendMessage({ type: "course2md-chunk", jobId, data });
+    const ok = await chrome.runtime.sendMessage({ type: "course2md-chunk", jobId, index, data });
     if (!ok) throw new Error("扩展端已停止接收");
   };
   try {
