@@ -156,7 +156,17 @@ function pickVideo() {
   const playing = videos.filter((v) => !v.paused && v.currentTime > 0);
   const pool = playing.length ? playing : videos;
   const best = pool.sort((a, b) => area(b) - area(a))[0];
-  return { src: best.currentSrc || best.src };
+  const src = best.currentSrc || best.src;
+  if (!src.startsWith("blob:")) return { src };
+  // blob: 视频流（MediaSource）没有文件地址；但抖音这类网站流里分段请求的仍是一个完整 mp4，
+  // 从页面的网络请求记录里找最近一次请求的 mp4 地址，不带 Range 再取一次就是整个文件。
+  // 只认完整 mp4（.mp4 或 mime_type=video_mp4）；HLS / DASH 分片拿不到整片，交回页面网址处理。
+  const mp4 = performance
+    .getEntriesByType("resource")
+    .map((e) => e.name)
+    .filter((u) => /^https?:/i.test(u) && /mime_type=video_mp4|\.mp4(\?|$)/i.test(u))
+    .pop();
+  return { src: mp4 || src };
 }
 
 // ---------- 连接桥接程序 ----------
