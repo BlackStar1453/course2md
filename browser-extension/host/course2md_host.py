@@ -245,17 +245,22 @@ def problems_of(outcomes):
 
 
 SUB_DIR = HOME / "Library/Caches/course2md-ext"
-MAX_SUBTITLE_CHARS = 32 * 1024 * 1024  # 与 course2md 读取字幕的上限一致
+MAX_SUBTITLE_BYTES = 32 * 1024 * 1024  # 与 course2md 读取字幕的字节上限一致
 
 
 def write_subtitle(job_id, text):
     """把扩展在页面里取到的字幕存成临时 VTT（按任务区分，避免同一视频并发时互相覆盖）。"""
-    if len(text) > MAX_SUBTITLE_CHARS:
+    data = text.encode("utf-8")
+    if len(data) > MAX_SUBTITLE_BYTES:
         raise ValueError("字幕太大")
     SUB_DIR.mkdir(parents=True, exist_ok=True)
     name = re.sub(r"[^\w-]", "_", job_id or str(os.getpid()))
     path = SUB_DIR / f"{name}.vtt"
-    path.write_text(text, encoding="utf-8")
+    try:
+        path.write_bytes(data)
+    except OSError:
+        path.unlink(missing_ok=True)  # 不留写了一半的文件
+        raise
     return path
 
 
@@ -342,11 +347,12 @@ def convert(source, audio_only=False, extra_args=(), notes=()):
     problems = problems_of(done.get("outcomes"))
     if audio_only:
         problems.append("只拿到声音，没有截图")
-    problems += list(notes)
+
     if not html and "exports.html" not in problems:
         problems.append("exports.html")
     send({"type": "done", "title": done.get("title"), "html": html,
-          "partial": bool(problems or done.get("partial")), "problems": problems})
+          "partial": bool(problems or done.get("partial")), "problems": problems,
+          "notes": list(notes)})
     subprocess.run(["open", "-a", str(APP)], check=False)
 
 

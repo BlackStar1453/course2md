@@ -229,7 +229,9 @@ async function openHost(job) {
         html: msg.html || null,
         noteTitle: msg.title || job.title,
       });
-      const extra = msg.problems && msg.problems.length ? `\n部分步骤失败：${msg.problems.join("、")}` : "";
+      const extra =
+        (msg.problems && msg.problems.length ? `\n部分步骤失败：${msg.problems.join("、")}` : "") +
+        (msg.notes && msg.notes.length ? `\n${msg.notes.join("；")}` : "");
       const tail = msg.html ? "\n点击打开笔记" : "\n没有生成网页版，请在 course2md 笔记库里查看";
       notify(job.id, msg.partial ? "course2md 已完成（有步骤失败）" : "course2md 已完成",
         `${(done && done.noteTitle) || job.title}${extra}${tail}`);
@@ -322,7 +324,10 @@ async function grabYouTubeCaptions(expectedId) {
     try {
       // 片头广告期间不会请求正片字幕，先等广告放完（最多 60 秒）
       for (let i = 0; i < 120 && player.classList.contains("ad-showing"); i++) await sleep(500);
-      if (player.getPlayerState() !== 1) {
+      if (currentId() !== expectedId) return { ok: false, reason: "取字幕时页面切换了视频" };
+      // 只有「暂停 / 未开始 / 已就绪」时才由我们来播放；缓冲中（3）本来就在播，不去碰
+      const state = player.getPlayerState();
+      if (state === 2 || state === -1 || state === 5) {
         const at = player.getCurrentTime();
         if (!player.isMuted()) {
           player.mute();
@@ -346,7 +351,9 @@ async function grabYouTubeCaptions(expectedId) {
         captured = findCaptured();
       }
     } finally {
+      // 页面已换成别的视频时不再恢复，免得暂停 / 跳转了新视频
       for (const undo of restore.reverse()) {
+        if (currentId() !== expectedId) break;
         try {
           undo();
         } catch {
@@ -366,18 +373,18 @@ async function grabYouTubeCaptions(expectedId) {
     if (kind) u.searchParams.set("kind", kind);
     else if (lang) u.searchParams.delete("kind");
     u.searchParams.set("fmt", "vtt");
-    const text = await (await fetch(u.href)).text();
-    return text.startsWith("WEBVTT") && text.includes("-->") ? text : null;
+    try {
+      const text = await (await fetch(u.href)).text();
+      return text.startsWith("WEBVTT") && text.includes("-->") ? text : null;
+    } catch {
+      return null;
+    }
   };
-  try {
-    const vtt =
-      (await fetchVtt(pick.languageCode, pick.kind === "asr" ? "asr" : null)) ||
-      (await fetchVtt(null, null)); // 退回播放器实际请求的那条轨道
-    if (!vtt) return { ok: false, reason: "字幕内容为空" };
-    return { ok: true, vtt, lang: pick.languageCode, kind: pick.kind || "manual" };
-  } catch (e) {
-    return { ok: false, reason: `取字幕失败：${e && e.message}` };
-  }
+  const vtt =
+    (await fetchVtt(pick.languageCode, pick.kind === "asr" ? "asr" : null)) ||
+    (await fetchVtt(null, null)); // 退回播放器实际请求的那条轨道
+  if (!vtt) return { ok: false, reason: "字幕内容为空或请求失败" };
+  return { ok: true, vtt, lang: pick.languageCode, kind: pick.kind || "manual" };
 }
 
 // ---------- 视频：页面里 fetch，分块传给桥接程序 ----------
