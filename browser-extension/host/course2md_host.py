@@ -244,11 +244,62 @@ def problems_of(outcomes):
     return bad
 
 
-def convert(source, audio_only=False):
+SUB_DIR = HOME / "Library/Caches/course2md-ext"
+MAX_SUBTITLE_CHARS = 32 * 1024 * 1024  # 与 course2md 读取字幕的上限一致
+
+
+def write_subtitle(job_id, text):
+    """把扩展在页面里取到的字幕存成临时 VTT（按任务区分，避免同一视频并发时互相覆盖）。"""
+    if len(text) > MAX_SUBTITLE_CHARS:
+        raise ValueError("字幕太大")
+    SUB_DIR.mkdir(parents=True, exist_ok=True)
+    name = re.sub(r"[^\w-]", "_", job_id or str(os.getpid()))
+    path = SUB_DIR / f"{name}.vtt"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def cli_supports_subtitle():
+    """已安装的 course2md 是否已有 --subtitle（新版才有）；旧版就退回语音识别，而不是报参数错误。"""
+    try:
+        r = subprocess.run([str(CLI), "--help"], capture_output=True, text=True, timeout=20)
+        return "--subtitle" in r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def convert_message(msg):
+    """处理 convert 消息：带字幕就用 --subtitle；要求兜底就改用语音识别（避开会 429 的在线字幕）。"""
+    extra, notes, sub_path = [], [], None
+    if msg.get("subtitle") and not cli_supports_subtitle():
+        log("已安装的 course2md 还不支持 --subtitle，改用语音识别")
+        extra = ["--transcript-source", "asr"]
+        notes.append("course2md 版本过旧，不能直接用网页字幕，已改用语音识别（升级后即可）")
+    elif msg.get("subtitle"):
+        try:
+            sub_path = write_subtitle(msg.get("jobId"), msg["subtitle"])
+            extra = ["--subtitle", str(sub_path)]
+        except (OSError, ValueError) as e:
+            log(f"字幕写入失败，改用语音识别：{e}")
+            extra = ["--transcript-source", "asr"]
+            notes.append("网页字幕不可用，改用语音识别")
+    elif msg.get("asrFallback"):
+        extra = ["--transcript-source", "asr"]
+        if msg.get("note"):
+            notes.append(msg["note"])
+    try:
+        convert(msg.get("source") or "", extra_args=extra, notes=notes)
+    finally:
+        if sub_path:
+            sub_path.unlink(missing_ok=True)
+
+
+def convert(source, audio_only=False, extra_args=(), notes=()):
     if not CLI.is_file():
         return send({"type": "error", "message": f"没找到 {CLI}，请先安装 course2md"})
 
-    cmd = [str(CLI), source, "-o", library_root(), "--json", "--formats", "md,html", "--no-llm-hint", *LLM_ARGS]
+    cmd = [str(CLI), source, "-o", library_root(), "--json", "--formats", "md,html", "--no-llm-hint",
+           *LLM_ARGS, *extra_args]
     log("运行: " + " ".join(cmd))
     env = dict(os.environ)
     # Chrome 拉起的进程不读 shell 配置，补上 ffmpeg / yt-dlp / claude 的常见位置。
@@ -291,6 +342,7 @@ def convert(source, audio_only=False):
     problems = problems_of(done.get("outcomes"))
     if audio_only:
         problems.append("只拿到声音，没有截图")
+    problems += list(notes)
     if not html and "exports.html" not in problems:
         problems.append("exports.html")
     send({"type": "done", "title": done.get("title"), "html": html,
@@ -318,7 +370,7 @@ def main():
     if not msg:
         return
     if kind == "convert":
-        convert(msg.get("source") or "")
+        convert_message(msg)
     elif kind == "begin":
         if not CLI.is_file():
             return send({"type": "error", "message": f"没找到 {CLI}，请先安装 course2md"})

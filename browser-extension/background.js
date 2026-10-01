@@ -72,6 +72,27 @@ function isNativeSite(url) {
   }
 }
 
+function isYouTube(url) {
+  try {
+    const host = new URL(url).hostname;
+    return ["youtube.com", "youtu.be"].some((h) => host === h || host.endsWith("." + h));
+  } catch {
+    return false;
+  }
+}
+
+// youtube.com/watch?v=<id> 返回视频 ID，其他页面返回 null。
+function youTubeWatchId(url) {
+  try {
+    const u = new URL(url);
+    if (!isYouTube(url) || u.pathname !== "/watch") return null;
+    const id = u.searchParams.get("v");
+    return id && /^[\w-]{11}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
 function safeName(title) {
   const name = (title || "")
     .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, " ")
@@ -128,8 +149,14 @@ chrome.action.onClicked.addListener(async (tab) => {
   };
   await putJob(job);
 
+  const ytId = youTubeWatchId(tab.url);
+  if (ytId) {
+    return convertYouTube(job, ytId);
+  }
   if (isNativeSite(tab.url)) {
-    return convertUrl(job, tab.url);
+    // B站等：course2md 自己处理。YouTube 的 Shorts / 其他页面没法在页面里取字幕，
+    // 改用语音识别，避开会 429 的在线字幕下载。
+    return convertUrl(job, tab.url, isYouTube(tab.url) ? { asrFallback: true } : {});
   }
 
   let picked;
@@ -223,11 +250,134 @@ async function openHost(job) {
   return port;
 }
 
-async function convertUrl(job, url) {
+// extra：{ subtitle: <VTT 文本> } 用浏览器里取到的字幕；{ asrFallback: true, note } 改用语音识别。
+async function convertUrl(job, url, extra = {}) {
   const port = await openHost(job);
   if (!port) return;
   await patchJob(job.id, { status: "converting" });
-  port.postMessage({ type: "convert", source: url, title: job.title });
+  port.postMessage({ type: "convert", jobId: job.id, source: url, title: job.title, ...extra });
+}
+
+// ---------- YouTube：在页面里取字幕（带播放器自己的 PO Token），再交给 course2md ----------
+
+async function convertYouTube(job, videoId) {
+  setBadge("字幕");
+  let r;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: job.tabId },
+      world: "MAIN", // 要调用页面播放器的方法（#movie_player 上的 API 只在页面环境可见）
+      func: grabYouTubeCaptions,
+      args: [videoId],
+    });
+    r = res && res.result;
+  } catch (e) {
+    r = { ok: false, reason: e.message };
+  }
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  if (r && r.ok) {
+    return convertUrl(job, url, { subtitle: r.vtt });
+  }
+  return convertUrl(job, url, {
+    asrFallback: true,
+    note: `没取到网页字幕（${(r && r.reason) || "未知原因"}），改用语音识别`,
+  });
+}
+
+// 注入页面（MAIN world）执行。实测（2026-10）：字幕地址不带 pot 时返回空内容；
+// 播放器开字幕时自己发出的 timedtext 请求带 pot（与视频 ID 绑定），换 lang / fmt 后可取任意轨道的 VTT。
+// 选轨：人工中文字幕 > 原语言（人工优先于自动生成）；不用机器翻译。
+// 若播放器还没请求过字幕：临时静音播放并打开字幕，拿到请求后只恢复自己改过的状态。
+async function grabYouTubeCaptions(expectedId) {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const player = document.querySelector("#movie_player");
+  if (!player || !player.getPlayerResponse) return { ok: false, reason: "找不到播放器" };
+  const currentId = () => (player.getVideoData && player.getVideoData().video_id) || "";
+  if (currentId() !== expectedId) return { ok: false, reason: "页面上的视频已经变了" };
+
+  const response = player.getPlayerResponse();
+  const tracks = (response && response.captions &&
+    response.captions.playerCaptionsTracklistRenderer &&
+    response.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+  if (!tracks.length) return { ok: false, reason: "这个视频没有字幕" };
+  const manual = tracks.filter((t) => t.kind !== "asr");
+  const auto = tracks.find((t) => t.kind === "asr");
+  const pick =
+    manual.find((t) => /^zh/i.test(t.languageCode)) ||
+    (auto && (manual.find((t) => t.languageCode === auto.languageCode) || auto)) ||
+    manual[0];
+
+  const findCaptured = () =>
+    performance
+      .getEntriesByType("resource")
+      .map((e) => e.name)
+      .filter((u) => u.includes("/api/timedtext"))
+      .map((u) => new URL(u))
+      .filter((u) => u.searchParams.get("v") === expectedId && u.searchParams.get("pot"))
+      .pop();
+
+  let captured = findCaptured();
+  if (!captured) {
+    const restore = [];
+    try {
+      // 片头广告期间不会请求正片字幕，先等广告放完（最多 60 秒）
+      for (let i = 0; i < 120 && player.classList.contains("ad-showing"); i++) await sleep(500);
+      if (player.getPlayerState() !== 1) {
+        const at = player.getCurrentTime();
+        if (!player.isMuted()) {
+          player.mute();
+          restore.push(() => player.unMute());
+        }
+        player.playVideo();
+        restore.push(() => {
+          player.pauseVideo();
+          player.seekTo(at, true);
+        });
+        for (let i = 0; i < 20 && player.getPlayerState() !== 1; i++) await sleep(250);
+      }
+      const ccTrack = player.getOption && player.getOption("captions", "track");
+      if (!(ccTrack && ccTrack.languageCode)) {
+        if (player.toggleSubtitlesOn) player.toggleSubtitlesOn();
+        else player.toggleSubtitles();
+        restore.push(() => player.toggleSubtitles());
+      }
+      for (let i = 0; i < 20 && !captured; i++) {
+        await sleep(500);
+        captured = findCaptured();
+      }
+    } finally {
+      for (const undo of restore.reverse()) {
+        try {
+          undo();
+        } catch {
+          // 尽力恢复
+        }
+      }
+    }
+  }
+  if (currentId() !== expectedId) return { ok: false, reason: "取字幕时页面切换了视频" };
+  if (!captured) return { ok: false, reason: "播放器没有发出字幕请求" };
+
+  const fetchVtt = async (lang, kind) => {
+    const u = new URL(captured.href);
+    u.searchParams.delete("tlang");
+    u.searchParams.delete("name");
+    if (lang) u.searchParams.set("lang", lang);
+    if (kind) u.searchParams.set("kind", kind);
+    else if (lang) u.searchParams.delete("kind");
+    u.searchParams.set("fmt", "vtt");
+    const text = await (await fetch(u.href)).text();
+    return text.startsWith("WEBVTT") && text.includes("-->") ? text : null;
+  };
+  try {
+    const vtt =
+      (await fetchVtt(pick.languageCode, pick.kind === "asr" ? "asr" : null)) ||
+      (await fetchVtt(null, null)); // 退回播放器实际请求的那条轨道
+    if (!vtt) return { ok: false, reason: "字幕内容为空" };
+    return { ok: true, vtt, lang: pick.languageCode, kind: pick.kind || "manual" };
+  } catch (e) {
+    return { ok: false, reason: `取字幕失败：${e && e.message}` };
+  }
 }
 
 // ---------- 视频：页面里 fetch，分块传给桥接程序 ----------
