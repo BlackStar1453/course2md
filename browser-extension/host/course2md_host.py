@@ -202,6 +202,7 @@ def convert(source):
 
     if code != 0 or done is None:
         detail = "；".join(errors) or "".join(stderr_tail).strip()[-300:] or f"退出码 {code}"
+        log(f"转换失败（退出码 {code}）：{detail}")
         return send({"type": "error", "message": f"course2md 转换失败：{detail}"})
 
     html = find_html(done)
