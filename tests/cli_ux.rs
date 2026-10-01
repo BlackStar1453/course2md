@@ -278,6 +278,98 @@ printf 'raw downloader stderr\n' >&2
     assert!(video.is_file());
 }
 
+#[cfg(all(unix, feature = "integration"))]
+#[test]
+fn subtitle_flag_uses_the_given_file_and_never_fetches_subtitles() {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = CliTest::new();
+    let video = cli.dir.path().join("fixture.mp4");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=320x180:d=3",
+            "-c:v",
+            "libx264",
+            "-y",
+        ])
+        .arg(&video)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", stderr(&generated));
+    let subtitle = cli.dir.path().join("browser.vtt");
+    std::fs::write(
+        &subtitle,
+        "WEBVTT\n\n00:00:00.000 --> 00:00:02.500\nCaptured in the browser.\n",
+    )
+    .unwrap();
+    // 字幕下载（--skip-download）一旦被调用就留下标记并失败，模拟 YouTube 字幕 429
+    let marker = cli.dir.path().join("subtitle-fetch-called");
+    let bin = cli.dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("yt-dlp");
+    std::fs::write(&script, r#"#!/bin/sh
+output=''
+simulate=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --simulate) simulate=1 ;;
+    --no-simulate) simulate=0 ;;
+    -o) shift; output="$1" ;;
+    --skip-download) : > "$CLI_TEST_MARKER"; echo 'HTTP Error 429: Too Many Requests' >&2; exit 1 ;;
+  esac
+  shift
+done
+if [ "$simulate" -eq 1 ]; then
+  printf '%s\n' '{"title":"Test lecture","id":"test","webpage_url":"https://example.test/video","duration":3,"extractor":"test","subtitles":{"zh-Hans":[{"ext":"srt","url":"https://example.test/zh.srt"}]},"automatic_captions":{}}'
+else
+  /bin/cp "$CLI_TEST_VIDEO" "$output"
+fi
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output_dir = cli.dir.path().join("out");
+    let result = Command::new(env!("CARGO_BIN_EXE_course2md"))
+        .args(["https://example.test/video", "--json", "--subtitle"])
+        .arg(&subtitle)
+        .arg("-o")
+        .arg(&output_dir)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("CLI_TEST_VIDEO", &video)
+        .env("CLI_TEST_MARKER", &marker)
+        .env("XDG_CONFIG_HOME", cli.dir.path().join("config"))
+        .env("XDG_CACHE_HOME", cli.dir.path().join("cache"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        stdout(&result),
+        stderr(&result)
+    );
+    assert!(!marker.exists(), "subtitle download must not be attempted");
+    let done: serde_json::Value =
+        serde_json::from_str(stdout(&result).lines().last().unwrap()).unwrap();
+    assert_eq!(done["type"], "done");
+    let notes = std::path::Path::new(done["out_dir"].as_str().unwrap()).join("course.md");
+    assert!(
+        std::fs::read_to_string(notes)
+            .unwrap()
+            .contains("Captured in the browser.")
+    );
+}
+
 #[test]
 fn version_flags_include_the_build_commit() {
     let cli = CliTest::new();

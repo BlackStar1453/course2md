@@ -24,9 +24,16 @@ const FRAME_DIGEST_LANES: usize = 4;
 
 /// Traditional CLI entry. Its generated task directory is stable for compatible recovery.
 /// New settings or --no-resume use another work directory and never overwrite old notes.
-pub async fn run(cfg: &PipelineConfig) -> Result<()> {
+///
+/// `subtitle`（`--subtitle`）给定时直接用这份字幕，不再在线获取字幕（视频仍照常下载）；
+/// 它优先于 `--transcript-source` 与本地同名字幕，且字幕内容计入任务标识，换字幕不会复用旧笔记。
+pub async fn run(cfg: &PipelineConfig, subtitle: Option<&Path>) -> Result<()> {
     let started = Instant::now();
     cfg.validate().context("配置预检失败 / Invalid settings")?;
+    // 先读字幕：文件有问题在下载 / 探测之前就失败
+    let selected = subtitle
+        .map(|path| -> Result<_> { Ok((load_subtitle_file(path)?, execution::file_digest(path)?)) })
+        .transpose()?;
     let local = Path::new(&cfg.url);
     let is_local = local.is_file();
     if !is_local {
@@ -85,8 +92,12 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     let mut identity_config = cfg.clone();
     identity_config.llm.api_key.clear();
     identity_config.asr_api.api_key.clear();
-    let binding =
-        serde_json::json!({"source_id": source_id, "config": identity_config, "title": meta.title});
+    let binding = identity_binding(
+        &source_id,
+        &identity_config,
+        &meta.title,
+        selected.as_ref().map(|(_, digest)| digest.as_str()),
+    );
     let mut task_id = execution::digest(&serde_json::to_vec(&binding)?);
     if !cfg.resume {
         task_id = format!(
@@ -122,12 +133,16 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
         write_failure_run_json(&cfg, is_local, &platform, &meta.id, &error, started);
         return Err(error);
     }
+    let subtitles = match selected {
+        Some((events, _)) => SubtitleInput::Selected(Some(events)),
+        None => SubtitleInput::Discover(probed),
+    };
     let result = run_prepared(
         &cfg,
         &meta,
         &target,
         is_local,
-        SubtitleInput::Discover(probed),
+        subtitles,
         false,
         false,
         started,
@@ -514,6 +529,30 @@ fn export_for_task(
         )?,
     )?;
     Ok(destination.to_path_buf())
+}
+
+/// 读取 `--subtitle` 指定的字幕文件（SRT / WebVTT），解析并校验。
+pub(crate) fn load_subtitle_file(path: &Path) -> Result<Vec<timeline::TranscriptEvent>> {
+    let content = crate::subtitle::read_subtitle_text(path)?;
+    let events = crate::subtitle::parse_subtitle(&content);
+    execution::validate_events(&events).with_context(|| {
+        format!("字幕文件不可用 {0} / Unusable subtitle file {0}", path.display())
+    })?;
+    Ok(events)
+}
+
+/// 任务标识的绑定内容。只有给了字幕文件才加入其摘要，保证不带 `--subtitle` 时与旧版逐字相同。
+fn identity_binding(
+    source_id: &str,
+    config: &PipelineConfig,
+    title: &str,
+    subtitle_digest: Option<&str>,
+) -> serde_json::Value {
+    let mut binding = serde_json::json!({"source_id": source_id, "config": config, "title": title});
+    if let Some(digest) = subtitle_digest {
+        binding["subtitle"] = digest.into();
+    }
+    binding
 }
 
 enum SubtitleInput {
@@ -1152,6 +1191,47 @@ mod tests {
     use super::{run, should_delete_media};
 
     #[test]
+    fn selected_subtitle_file_is_parsed_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let vtt = dir.path().join("track.vtt");
+        std::fs::write(
+            &vtt,
+            "WEBVTT\n\n00:00:00.000 --> 00:00:02.500\nfirst line\n\n00:00:02.500 --> 00:00:05.000\nsecond line\n",
+        )
+        .unwrap();
+        let events = super::load_subtitle_file(&vtt).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].text, "first line");
+        assert_eq!(events[1].end, 5.0);
+
+        let empty = dir.path().join("empty.vtt");
+        std::fs::write(&empty, "WEBVTT\n\n").unwrap();
+        assert!(super::load_subtitle_file(&empty).is_err());
+        assert!(super::load_subtitle_file(&dir.path().join("missing.vtt")).is_err());
+    }
+
+    #[test]
+    fn task_identity_changes_only_when_a_subtitle_file_is_given() {
+        let cfg = crate::options::resolve(
+            "https://example.invalid/video".into(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let plain = super::identity_binding("test:abc", &cfg, "Title", None);
+        // 不带 --subtitle 时与旧版绑定逐字相同，已有任务 ID 不变
+        assert_eq!(
+            plain,
+            serde_json::json!({"source_id": "test:abc", "config": cfg, "title": "Title"})
+        );
+        let a = super::identity_binding("test:abc", &cfg, "Title", Some("digest-a"));
+        let b = super::identity_binding("test:abc", &cfg, "Title", Some("digest-b"));
+        assert_eq!(a["subtitle"], "digest-a");
+        assert_ne!(a, plain);
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn recovery_archives_unverified_media_and_reuses_only_matching_content() {
         let root = tempfile::tempdir().unwrap();
         let mut cfg = crate::options::resolve(
@@ -1252,7 +1332,7 @@ mod tests {
             mmproj_offload: true,
             transcript_source: c::TranscriptSource::Asr,
         };
-        let r = tokio::runtime::Runtime::new().unwrap().block_on(run(&cfg));
+        let r = tokio::runtime::Runtime::new().unwrap().block_on(run(&cfg, None));
         assert!(r.is_err(), "损坏视频必须失败");
 
         let source_id = format!(

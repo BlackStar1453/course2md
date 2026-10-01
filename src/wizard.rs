@@ -35,6 +35,8 @@ pub fn maybe_run(
 ) -> Result<crate::settings::ConfigFile> {
     if opts.quiet
         || opts.json
+        // 自带字幕文件不需要语音识别，不弹识别设置向导
+        || opts.subtitle.is_some()
         || matches!(
             opts.transcript_source.or(file.defaults.transcript_source),
             Some(crate::config::TranscriptSource::Subtitle)

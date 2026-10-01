@@ -126,10 +126,14 @@ pub fn resolve(
             opts.no_mmproj_offload,
             d.mmproj_offload,
         ),
-        transcript_source: opts
-            .transcript_source
-            .or(d.transcript_source)
-            .unwrap_or_default(),
+        // --subtitle 自带字幕：固定为字幕来源，免去 ASR 预检，也不与配置里的 asr 冲突
+        transcript_source: if opts.subtitle.is_some() {
+            crate::config::TranscriptSource::Subtitle
+        } else {
+            opts.transcript_source
+                .or(d.transcript_source)
+                .unwrap_or_default()
+        },
     })
 }
 
@@ -189,6 +193,18 @@ mod tests {
         assert!(!cfg.keep_video && !cfg.resume);
         assert_eq!(cfg.stable_secs, -1.0);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn subtitle_file_forces_subtitle_source_over_config_asr() {
+        let mut file = settings::ConfigFile::default();
+        file.defaults.transcript_source = Some(config::TranscriptSource::Asr);
+        let opts = RunOpts {
+            subtitle: Some("captions.vtt".into()),
+            ..Default::default()
+        };
+        let cfg = resolve("video".into(), &opts, &file).unwrap();
+        assert_eq!(cfg.transcript_source, config::TranscriptSource::Subtitle);
     }
 
     #[test]

@@ -372,7 +372,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let cfg = course2md::options::resolve(source, &cli.opts, &file)?;
             // 全量预检在 pipeline::run 开头做（下载/抽帧/模型加载之前，毫秒级失败）
             tracing::info!(out = %cfg.out_dir.display(), provider = %cfg.provider, "start");
-            tokio::runtime::Runtime::new()?.block_on(pipeline::run(&cfg))
+            tokio::runtime::Runtime::new()?.block_on(pipeline::run(&cfg, cli.opts.subtitle.as_deref()))
         }
     }
 }

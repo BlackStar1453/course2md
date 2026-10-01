@@ -153,6 +153,11 @@ pub struct RunOpts {
     #[arg(help_heading = "输入与输出 / Input and output")]
     pub transcript_source: Option<crate::config::TranscriptSource>,
 
+    /// 使用指定字幕文件（SRT / WebVTT），不再在线获取字幕；优先于 --transcript-source / Use this subtitle file (SRT / WebVTT) instead of fetching subtitles; overrides --transcript-source
+    #[arg(long, value_name = "FILE")]
+    #[arg(help_heading = "输入与输出 / Input and output")]
+    pub subtitle: Option<std::path::PathBuf>,
+
     /// GPU 卸载层数（0–99）；核显不稳定时可降低 / GPU offload layers; lower on unstable integrated GPUs
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..=99))]
     #[arg(help_heading = "语音识别 / Speech recognition")]
